@@ -125,9 +125,17 @@ class HabboWatch(commands.Cog):
                 warn = False
                 title = "Online"
             else:
-                if days_offline is not None and days_offline > float(threshold_days):
-                    warn = True
-                    title = "Offline Warning"
+                if online is False and days_offline is not None:
+                    threshold = float(threshold_days)
+                    if days_offline >= threshold:
+                        warn = True
+                        title = "Offline Warning"
+                    elif threshold == 3 and days_offline >= 2.5:
+                        warn = True
+                        title = "Offline Warning (Approaching 3 Days)"
+                    else:
+                        warn = False
+                        title = "Recent Activity"
                 else:
                     warn = False
                     title = "Recent Activity"
@@ -135,10 +143,11 @@ class HabboWatch(commands.Cog):
         if member_since_dt:
             lines.append(f"## Member Since: {member_since_dt.strftime('%Y-%m-%d')}")
 
+        warn_titles = ("Offline Warning", "Offline Warning (Approaching 3 Days)", "Profile Hidden")
         embed = discord.Embed(
             title=title,
             description="\n".join(lines),
-            colour=discord.Colour.red() if title in ("Offline Warning", "Profile Hidden") else discord.Colour.blurple(),
+            colour=discord.Colour.red() if title in warn_titles else discord.Colour.blurple(),
             timestamp=datetime.now(timezone.utc),
         )
         embed.set_thumbnail(url=avatar_url)
@@ -185,9 +194,10 @@ class HabboWatch(commands.Cog):
                 continue
             for username in members:
                 key = username.lower()
-                # choose the strictest threshold if user appears in multiple groups
+                # choose the least strict threshold if user appears in multiple groups
+                # (e.g., MODs at 3 days should override OOA 1-day rules)
                 if key in threshold_map:
-                    threshold_map[key] = min(threshold_map[key], float(threshold_days))
+                    threshold_map[key] = max(threshold_map[key], float(threshold_days))
                 else:
                     threshold_map[key] = float(threshold_days)
 
