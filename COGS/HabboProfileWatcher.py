@@ -73,6 +73,10 @@ class HabboWatch(commands.Cog):
         try:
             if ts.endswith("Z"):
                 ts = ts[:-1] + "+00:00"
+            else:
+                ts = ts.replace(" ", "T")
+                if ts.endswith("+0000"):
+                    ts = ts[:-5] + "+00:00"
             return datetime.fromisoformat(ts)
         except Exception:
             return None
