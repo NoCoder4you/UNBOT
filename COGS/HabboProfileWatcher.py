@@ -73,6 +73,10 @@ class HabboWatch(commands.Cog):
         try:
             if ts.endswith("Z"):
                 ts = ts[:-1] + "+00:00"
+            else:
+                ts = ts.replace(" ", "T")
+                if ts.endswith("+0000"):
+                    ts = ts[:-5] + "+00:00"
             return datetime.fromisoformat(ts)
         except Exception:
             return None
@@ -125,7 +129,7 @@ class HabboWatch(commands.Cog):
                 warn = False
                 title = "Online"
             else:
-                if online is False and days_offline is not None:
+                if days_offline is not None:
                     threshold = float(threshold_days)
                     if days_offline >= threshold:
                         warn = True
@@ -153,7 +157,7 @@ class HabboWatch(commands.Cog):
         embed.set_thumbnail(url=avatar_url)
         embed.set_footer(text=f"{self.bot.user.name} - Siren - Noah")
         # return online flag and last_access_dt for transition logic
-        return warn, embed, bool(online), last_access_dt, name, avatar_url
+        return warn, embed, online is True, last_access_dt, name, avatar_url
 
     def make_back_online_embed(self, name: str, avatar_url: str, went_offline_at: datetime | None):
         lines = [f"## Habbo: [{name}](https://www.habbo.com/profile/{name})"]
