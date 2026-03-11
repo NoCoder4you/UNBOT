@@ -298,10 +298,6 @@ class HabboWatch(commands.Cog):
             previous_online = st.get("was_online")
             is_online = user_json.get("online", user_json.get("isOnline")) is True
 
-            # Restore tracked offline windows after bot restarts.
-            # If we do not have in-memory status yet and the user is currently offline,
-            # seed `offline_since` from persisted JSON transition data so milestones
-            # continue progressing even before the user comes online again.
             if previous_online is None and (not is_online) and st.get("offline_since") is None:
                 restored_offline_since = (
                     self.parse_iso(self.logoff_times.get(username_lc))
