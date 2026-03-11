@@ -19,8 +19,12 @@ class HabboWatch(commands.Cog):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self._state: dict[str, dict] = {}
-        self.last_online_file = Path("JSON") / "habbo_last_online.json"
+        # Resolve JSON storage from the bot root (..../UNBOT/JSON) even though this cog lives in COGS/.
+        bot_root = Path(__file__).resolve().parent.parent
+        self.last_online_file = bot_root / "JSON" / "habbo_last_online.json"
+        self.logoff_file = bot_root / "JSON" / "habbo_logoff_times.json"
         self.last_online_times = self.load_last_online_times()
+        self.logoff_times = self.load_logoff_times()
         self.periodic_check.start()
 
     async def cog_unload(self):
@@ -50,6 +54,31 @@ class HabboWatch(commands.Cog):
             self.last_online_file.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(self.last_online_times, indent=2, sort_keys=True)
             self.last_online_file.write_text(payload, encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_logoff_times(self) -> dict[str, str]:
+        """Load persisted active->offline transition timestamps from JSON storage."""
+        try:
+            self.logoff_file.parent.mkdir(parents=True, exist_ok=True)
+            if not self.logoff_file.exists():
+                # Create the logoff file so each tracked transition is durable and auditable.
+                self.logoff_file.write_text("{}", encoding="utf-8")
+                return {}
+
+            data = json.loads(self.logoff_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k).lower(): str(v) for k, v in data.items() if isinstance(v, str)}
+        except Exception:
+            pass
+        return {}
+
+    def save_logoff_times(self):
+        """Persist active->offline transition timestamps to disk."""
+        try:
+            self.logoff_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.logoff_times, indent=2, sort_keys=True)
+            self.logoff_file.write_text(payload, encoding="utf-8")
         except Exception:
             pass
 
@@ -288,11 +317,17 @@ class HabboWatch(commands.Cog):
                 persisted_last_online = self.parse_iso(self.last_online_times.get(username_lc))
                 st["offline_since"] = persisted_last_online or datetime.now(timezone.utc)
                 st["sent_alerts"] = set()
+
+                # Persist an explicit logoff timestamp for the active->offline transition.
+                self.logoff_times[username_lc] = datetime.now(timezone.utc).isoformat()
                 state_changed = True
             elif went_online:
                 # Returning online ends the current offline tracking window.
                 st["offline_since"] = None
                 st["sent_alerts"] = set()
+
+                # Clear last logoff marker once they are active again.
+                self.logoff_times.pop(username_lc, None)
                 state_changed = True
 
             embed, _, alert_key, name, avatar_url = self.evaluate_user(
@@ -316,6 +351,7 @@ class HabboWatch(commands.Cog):
 
             if state_changed:
                 self.save_last_online_times()
+                self.save_logoff_times()
 
     @periodic_check.before_loop
     async def before_periodic(self):
