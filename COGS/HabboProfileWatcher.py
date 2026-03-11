@@ -90,7 +90,13 @@ class HabboWatch(commands.Cog):
             dt = dt.replace(tzinfo=timezone.utc)
         return (now - dt).total_seconds() / 86400.0
 
-    def evaluate_user(self, user_json: dict, requested_username: str, threshold_days: int):
+    def evaluate_user(
+        self,
+        user_json: dict,
+        requested_username: str,
+        threshold_days: int,
+        offline_since_dt: datetime | None,
+    ):
         name = user_json.get("name") or requested_username
         online = user_json.get("online", user_json.get("isOnline"))
         profile_visible = user_json.get("profileVisible", user_json.get("isProfileVisible"))
@@ -98,10 +104,11 @@ class HabboWatch(commands.Cog):
             profile_visible = bool(user_json.get("memberSince") or user_json.get("lastAccessTime"))
 
         last_access_raw = user_json.get("lastAccessTime") or user_json.get("lastAccess") or user_json.get("lastLoggedIn")
-        member_since_raw = user_json.get("memberSince")
         last_access_dt = self.parse_iso(last_access_raw)
-        member_since_dt = self.parse_iso(member_since_raw)
-        days_offline = self.days_since(last_access_dt)
+        # The offline counter should be based on when we last observed them online.
+        # If we do not have that in local state yet (for example after a restart),
+        # fall back to the API's last-access timestamp so we can still evaluate.
+        days_offline = self.days_since(offline_since_dt or last_access_dt)
 
         # Full-body avatar (direction changed to 3)
         figure = user_json.get("figureString") or user_json.get("figure")
@@ -123,7 +130,8 @@ class HabboWatch(commands.Cog):
             title = "Profile Hidden"
             warn = True
         else:
-            last_seen_str = last_access_dt.strftime("%Y-%m-%d %H:%M UTC") if last_access_dt else "Unknown"
+            last_seen_dt = offline_since_dt or last_access_dt
+            last_seen_str = last_seen_dt.strftime("%Y-%m-%d %H:%M UTC") if last_seen_dt else "Unknown"
             lines.append(f"## Last Seen: {last_seen_str}")
             if online is True:
                 warn = False
@@ -144,9 +152,6 @@ class HabboWatch(commands.Cog):
                     warn = False
                     title = "Recent Activity"
 
-        if member_since_dt:
-            lines.append(f"## Member Since: {member_since_dt.strftime('%Y-%m-%d')}")
-
         warn_titles = ("Offline Warning", "Offline Warning (Approaching 3 Days)", "Profile Hidden")
         embed = discord.Embed(
             title=title,
@@ -156,7 +161,7 @@ class HabboWatch(commands.Cog):
         )
         embed.set_thumbnail(url=avatar_url)
         embed.set_footer(text=f"{self.bot.user.name} - Siren - Noah")
-        # return online flag and last_access_dt for transition logic
+        # return online flag and API last_access_dt for transition logic fallback
         return warn, embed, online is True, last_access_dt, name, avatar_url
 
     def make_back_online_embed(self, name: str, avatar_url: str, went_offline_at: datetime | None):
@@ -213,16 +218,34 @@ class HabboWatch(commands.Cog):
                 self._state.pop(username_lc, None)
                 continue
 
-            warn, embed, is_online, last_access_dt, name, avatar_url = self.evaluate_user(user_json, username_lc, threshold)
-
             # previous state
-            st = self._state.get(username_lc, {"was_warn": False, "offline_since": None})
+            st = self._state.get(
+                username_lc,
+                {"was_warn": False, "offline_since": None, "was_online": None},
+            )
+
+            # Track the moment a user transitions from online -> offline.
+            # This gives us an offline counter that starts at "last active online"
+            # instead of relying solely on the API's last-access timestamp.
+            previous_online = st.get("was_online")
+            is_online = user_json.get("online", user_json.get("isOnline")) is True
+            if is_online:
+                st["offline_since"] = None
+            elif previous_online is True:
+                st["offline_since"] = datetime.now(timezone.utc)
+
+            warn, embed, _, last_access_dt, name, avatar_url = self.evaluate_user(
+                user_json,
+                username_lc,
+                threshold,
+                st.get("offline_since"),
+            )
 
             # Send warning if needed
             if warn:
                 # set offline_since if first time entering warn state
                 if not st["was_warn"]:
-                    st["offline_since"] = last_access_dt
+                    st["offline_since"] = st.get("offline_since") or last_access_dt
                 st["was_warn"] = True
                 await self.notify_user(embed)
             else:
@@ -236,6 +259,8 @@ class HabboWatch(commands.Cog):
                 else:
                     # if no warn and not online, just clear warn flag
                     st["was_warn"] = False
+
+            st["was_online"] = is_online
 
             self._state[username_lc] = st
 
@@ -260,7 +285,7 @@ class HabboWatch(commands.Cog):
             await interaction.followup.send("Check Complete", ephemeral=True)
             return
 
-        warn, embed, is_online, last_access_dt, name, avatar_url = self.evaluate_user(user_json, username, 3)
+        warn, embed, is_online, last_access_dt, name, avatar_url = self.evaluate_user(user_json, username, 3, None)
         if warn:
             await self.notify_user(embed)
         else:
