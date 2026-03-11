@@ -1,5 +1,7 @@
 import aiohttp
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -17,11 +19,69 @@ class HabboWatch(commands.Cog):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self._state: dict[str, dict] = {}
+        # Resolve JSON storage from the bot root (..../UNBOT/JSON) even though this cog lives in COGS/.
+        bot_root = Path(__file__).resolve().parent.parent
+        self.last_online_file = bot_root / "JSON" / "habbo_last_online.json"
+        self.logoff_file = bot_root / "JSON" / "habbo_logoff_times.json"
+        self.last_online_times = self.load_last_online_times()
+        self.logoff_times = self.load_logoff_times()
         self.periodic_check.start()
 
     async def cog_unload(self):
         self.periodic_check.cancel()
         await self.session.close()
+
+    def load_last_online_times(self) -> dict[str, str]:
+        """Load persisted last-online timestamps, creating JSON storage when missing."""
+        try:
+            self.last_online_file.parent.mkdir(parents=True, exist_ok=True)
+            if not self.last_online_file.exists():
+                # Create the JSON file the first time so operators can inspect/edit if needed.
+                self.last_online_file.write_text("{}", encoding="utf-8")
+                return {}
+
+            data = json.loads(self.last_online_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                # Keep only simple string timestamp values.
+                return {str(k).lower(): str(v) for k, v in data.items() if isinstance(v, str)}
+        except Exception:
+            pass
+        return {}
+
+    def save_last_online_times(self):
+        """Persist last-online timestamps to disk after state-changing events."""
+        try:
+            self.last_online_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.last_online_times, indent=2, sort_keys=True)
+            self.last_online_file.write_text(payload, encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_logoff_times(self) -> dict[str, str]:
+        """Load persisted active->offline transition timestamps from JSON storage."""
+        try:
+            self.logoff_file.parent.mkdir(parents=True, exist_ok=True)
+            if not self.logoff_file.exists():
+                # Create the logoff file so each tracked transition is durable and auditable.
+                self.logoff_file.write_text("{}", encoding="utf-8")
+                return {}
+
+            data = json.loads(self.logoff_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k).lower(): str(v) for k, v in data.items() if isinstance(v, str)}
+        except Exception:
+            pass
+        return {}
+
+    def save_logoff_times(self):
+        """Persist active->offline transition timestamps to disk."""
+        try:
+            self.logoff_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.logoff_times, indent=2, sort_keys=True)
+            self.logoff_file.write_text(payload, encoding="utf-8")
+        except Exception:
+            pass
+
 
     async def fetch_json(self, url: str, params: dict | None = None) -> dict | list | None:
         try:
@@ -90,18 +150,23 @@ class HabboWatch(commands.Cog):
             dt = dt.replace(tzinfo=timezone.utc)
         return (now - dt).total_seconds() / 86400.0
 
-    def evaluate_user(self, user_json: dict, requested_username: str, threshold_days: int):
+    def evaluate_user(
+        self,
+        user_json: dict,
+        requested_username: str,
+        offline_since_dt: datetime | None,
+    ):
+        """Build an embed from live status + tracked offline transition time.
+
+        Important behavior:
+        - Offline duration is based on `offline_since_dt` only (set when we observe online->offline).
+        - We intentionally avoid API last-access timestamps for watcher alert timing.
+        """
         name = user_json.get("name") or requested_username
-        online = user_json.get("online", user_json.get("isOnline"))
+        online = user_json.get("online", user_json.get("isOnline")) is True
         profile_visible = user_json.get("profileVisible", user_json.get("isProfileVisible"))
         if profile_visible is None:
             profile_visible = bool(user_json.get("memberSince") or user_json.get("lastAccessTime"))
-
-        last_access_raw = user_json.get("lastAccessTime") or user_json.get("lastAccess") or user_json.get("lastLoggedIn")
-        member_since_raw = user_json.get("memberSince")
-        last_access_dt = self.parse_iso(last_access_raw)
-        member_since_dt = self.parse_iso(member_since_raw)
-        days_offline = self.days_since(last_access_dt)
 
         # Full-body avatar (direction changed to 3)
         figure = user_json.get("figureString") or user_json.get("figure")
@@ -111,43 +176,52 @@ class HabboWatch(commands.Cog):
             avatar_url = f"https://www.habbo.com/habbo-imaging/avatarimage?user={name}&size=l&direction=3&head_direction=3"
 
         unique_id = user_json.get("uniqueId")
-
         lines = []
         if unique_id:
-            # Link using username rather than uniqueId
             lines.append(f"## Habbo: [{name}](https://www.habbo.com/profile/{name})")
         else:
             lines.append(f"## Habbo: {name}")
 
         if not profile_visible:
             title = "Profile Hidden"
-            warn = True
+            alert_key = "profile_hidden"
         else:
-            last_seen_str = last_access_dt.strftime("%Y-%m-%d %H:%M UTC") if last_access_dt else "Unknown"
-            lines.append(f"## Last Seen: {last_seen_str}")
-            if online is True:
-                warn = False
+            if online:
                 title = "Online"
-            else:
-                if days_offline is not None:
-                    threshold = float(threshold_days)
-                    if days_offline >= threshold:
-                        warn = True
-                        title = "Offline Warning"
-                    elif threshold == 3 and days_offline >= 2.5:
-                        warn = True
-                        title = "Offline Warning (Approaching 3 Days)"
-                    else:
-                        warn = False
-                        title = "Recent Activity"
+                alert_key = None
+                lines.append("## Status: Online")
+            elif offline_since_dt:
+                days_offline = self.days_since(offline_since_dt)
+                last_seen_str = offline_since_dt.strftime("%Y-%m-%d %H:%M UTC")
+                lines.append(f"## Last Seen Online: {last_seen_str}")
+
+                # Milestones requested by user: 2.0d, 2.5d, 3.0d
+                # We use these as one-shot alert keys so each is notified only once.
+                if days_offline is not None and days_offline >= 3.0:
+                    title = "Offline Warning"
+                    alert_key = "offline_3.0"
+                elif days_offline is not None and days_offline >= 2.5:
+                    title = "Offline Warning (Approaching 3 Days)"
+                    alert_key = "offline_2.5"
+                elif days_offline is not None and days_offline >= 2.0:
+                    title = "Offline Notice (2 Days)"
+                    alert_key = "offline_2.0"
                 else:
-                    warn = False
                     title = "Recent Activity"
+                    alert_key = None
+            else:
+                # User is offline, but we never observed a live online->offline transition yet.
+                # Per requirements, do not start tracking from API last-access values.
+                title = "Offline (Awaiting Online Observation)"
+                alert_key = None
+                lines.append("## Status: Offline (tracking starts after they are seen online first)")
 
-        if member_since_dt:
-            lines.append(f"## Member Since: {member_since_dt.strftime('%Y-%m-%d')}")
-
-        warn_titles = ("Offline Warning", "Offline Warning (Approaching 3 Days)", "Profile Hidden")
+        warn_titles = (
+            "Offline Notice (2 Days)",
+            "Offline Warning (Approaching 3 Days)",
+            "Offline Warning",
+            "Profile Hidden",
+        )
         embed = discord.Embed(
             title=title,
             description="\n".join(lines),
@@ -156,8 +230,7 @@ class HabboWatch(commands.Cog):
         )
         embed.set_thumbnail(url=avatar_url)
         embed.set_footer(text=f"{self.bot.user.name} - Siren - Noah")
-        # return online flag and last_access_dt for transition logic
-        return warn, embed, online is True, last_access_dt, name, avatar_url
+        return embed, online, alert_key, name, avatar_url
 
     def make_back_online_embed(self, name: str, avatar_url: str, went_offline_at: datetime | None):
         lines = [f"## Habbo: [{name}](https://www.habbo.com/profile/{name})"]
@@ -190,6 +263,7 @@ class HabboWatch(commands.Cog):
     @tasks.loop(minutes=10)
     async def periodic_check(self):
         # Build a username -> threshold map, de-duping across groups
+        # (threshold currently unused because alerts are fixed at 2/2.5/3 days).
         threshold_map: dict[str, float] = {}
 
         for group_id, threshold_days in GROUPS:
@@ -198,46 +272,105 @@ class HabboWatch(commands.Cog):
                 continue
             for username in members:
                 key = username.lower()
-                # choose the least strict threshold if user appears in multiple groups
-                # (e.g., MODs at 3 days should override OOA 1-day rules)
                 if key in threshold_map:
                     threshold_map[key] = max(threshold_map[key], float(threshold_days))
                 else:
                     threshold_map[key] = float(threshold_days)
 
-        # Now check each unique user once
-        for username_lc, threshold in threshold_map.items():
+        # Check each unique user once.
+        for username_lc in threshold_map:
             user_json = await self.fetch_habbo_user(username_lc)
             if not user_json:
-                # clear state if they disappear from API
                 self._state.pop(username_lc, None)
                 continue
 
-            warn, embed, is_online, last_access_dt, name, avatar_url = self.evaluate_user(user_json, username_lc, threshold)
+            st = self._state.get(
+                username_lc,
+                {"was_online": None, "offline_since": None, "sent_alerts": set()},
+            )
 
-            # previous state
-            st = self._state.get(username_lc, {"was_warn": False, "offline_since": None})
+            # Normalize alert history to a set in case older state shape exists.
+            sent_alerts = st.get("sent_alerts")
+            if not isinstance(sent_alerts, set):
+                sent_alerts = set(sent_alerts or [])
+                st["sent_alerts"] = sent_alerts
 
-            # Send warning if needed
-            if warn:
-                # set offline_since if first time entering warn state
-                if not st["was_warn"]:
-                    st["offline_since"] = last_access_dt
-                st["was_warn"] = True
+            previous_online = st.get("was_online")
+            is_online = user_json.get("online", user_json.get("isOnline")) is True
+
+            # Restore tracked offline windows after bot restarts.
+            # If we do not have in-memory status yet and the user is currently offline,
+            # seed `offline_since` from persisted JSON transition data so milestones
+            # continue progressing even before the user comes online again.
+            if previous_online is None and (not is_online) and st.get("offline_since") is None:
+                # Restore only from an explicit persisted logoff marker.
+                # Do NOT fall back to last_online_times here: if the bot was offline
+                # during the user's real logoff event, last_online can be much older
+                # and would overstate offline duration.
+                restored_offline_since = self.parse_iso(self.logoff_times.get(username_lc))
+                if restored_offline_since:
+                    st["offline_since"] = restored_offline_since
+
+                    # Do not auto-mark milestones as already sent during restore.
+                    # We only mark alert keys after a successful notify call so
+                    # thresholds crossed while the bot was offline can still notify
+                    # on the next loop instead of being suppressed forever.
+                    st["sent_alerts"] = set(st.get("sent_alerts") or [])
+
+            # Transition flags are used to reset tracking only when state changes,
+            # preventing repeated alerts while status is unchanged.
+            went_online = previous_online is False and is_online
+            went_offline = previous_online is True and (not is_online)
+            went_offline_at = st.get("offline_since")
+            state_changed = False
+
+            # Track only observed online->offline transitions.
+            if is_online:
+                # Continuously refresh last-online timestamp while online so it is durable across restarts.
+                self.last_online_times[username_lc] = datetime.now(timezone.utc).isoformat()
+                state_changed = True
+
+            if went_offline:
+                # Start offline tracking from the last observed online timestamp stored on disk.
+                # If that value is missing/corrupt, fall back to now to keep tracking functional.
+                persisted_last_online = self.parse_iso(self.last_online_times.get(username_lc))
+                st["offline_since"] = persisted_last_online or datetime.now(timezone.utc)
+                st["sent_alerts"] = set()
+
+                # Persist an explicit logoff timestamp for the active->offline transition.
+                self.logoff_times[username_lc] = datetime.now(timezone.utc).isoformat()
+                state_changed = True
+            elif went_online:
+                # Returning online ends the current offline tracking window.
+                st["offline_since"] = None
+                st["sent_alerts"] = set()
+
+                # Clear last logoff marker once they are active again.
+                self.logoff_times.pop(username_lc, None)
+                state_changed = True
+
+            embed, _, alert_key, name, avatar_url = self.evaluate_user(
+                user_json,
+                username_lc,
+                st.get("offline_since"),
+            )
+
+            # Send milestone/profile-hidden alerts only once per tracking window.
+            if alert_key and alert_key not in st["sent_alerts"]:
                 await self.notify_user(embed)
-            else:
-                # If previously warned and now online -> send "Back Online"
-                if st["was_warn"] and is_online:
-                    back_embed = self.make_back_online_embed(name, avatar_url, st.get("offline_since"))
-                    await self.notify_user(back_embed)
-                    # reset state
-                    st["was_warn"] = False
-                    st["offline_since"] = None
-                else:
-                    # if no warn and not online, just clear warn flag
-                    st["was_warn"] = False
+                st["sent_alerts"].add(alert_key)
 
+            # Send one recovery message when user comes back online.
+            if went_online and went_offline_at:
+                back_embed = self.make_back_online_embed(name, avatar_url, went_offline_at)
+                await self.notify_user(back_embed)
+
+            st["was_online"] = is_online
             self._state[username_lc] = st
+
+            if state_changed:
+                self.save_last_online_times()
+                self.save_logoff_times()
 
     @periodic_check.before_loop
     async def before_periodic(self):
@@ -260,16 +393,9 @@ class HabboWatch(commands.Cog):
             await interaction.followup.send("Check Complete", ephemeral=True)
             return
 
-        warn, embed, is_online, last_access_dt, name, avatar_url = self.evaluate_user(user_json, username, 3)
-        if warn:
+        embed, _is_online, alert_key, _name, _avatar_url = self.evaluate_user(user_json, username, None)
+        if alert_key:
             await self.notify_user(embed)
-        else:
-            # optional: if they are online now and previously warned in memory, send back-online here too
-            st = self._state.get(username.lower(), {"was_warn": False, "offline_since": None})
-            if st["was_warn"] and is_online:
-                back_embed = self.make_back_online_embed(name, avatar_url, st.get("offline_since"))
-                await self.notify_user(back_embed)
-                self._state[username.lower()] = {"was_warn": False, "offline_since": None}
 
         await interaction.followup.send("Check Complete", ephemeral=True)
 
