@@ -298,6 +298,26 @@ class HabboWatch(commands.Cog):
             previous_online = st.get("was_online")
             is_online = user_json.get("online", user_json.get("isOnline")) is True
 
+            if previous_online is None and (not is_online) and st.get("offline_since") is None:
+                restored_offline_since = (
+                    self.parse_iso(self.logoff_times.get(username_lc))
+                    or self.parse_iso(self.last_online_times.get(username_lc))
+                )
+                if restored_offline_since:
+                    st["offline_since"] = restored_offline_since
+
+                    # Reconstruct already-passed milestone keys to avoid duplicate alerts
+                    # immediately after restart when alert history was only in memory.
+                    restored_days = self.days_since(restored_offline_since)
+                    restored_alerts: set[str] = set(st.get("sent_alerts") or [])
+                    if restored_days is not None and restored_days >= 2.0:
+                        restored_alerts.add("offline_2.0")
+                    if restored_days is not None and restored_days >= 2.5:
+                        restored_alerts.add("offline_2.5")
+                    if restored_days is not None and restored_days >= 3.0:
+                        restored_alerts.add("offline_3.0")
+                    st["sent_alerts"] = restored_alerts
+
             # Transition flags are used to reset tracking only when state changes,
             # preventing repeated alerts while status is unchanged.
             went_online = previous_online is False and is_online
