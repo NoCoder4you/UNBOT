@@ -8,11 +8,27 @@ from discord.ext import commands, tasks
 
 NOTIFY_USER_ID = 298121351871594497  # DM recipient
 
-# Groups to watch: (GROUP_ID, THRESHOLD_DAYS)
-GROUPS = [
-    ("g-hhus-eb463e25366b3796072507bc69cbfee4", 3),
-    ("g-hhus-1685c3902d4ce5c8a4fcefa160fedaa2", 1),
-]
+# Group IDs supplied by the operator.
+MOD_GROUP_ID = "g-hhus-eb463e25366b3796072507bc69cbfee4"
+OOA_GROUP_ID = "g-hhus-1685c3902d4ce5c8a4fcefa160fedaa2"
+
+# Notification milestones by policy.
+# Tuple shape: (trigger_days_offline, embed_title, alert_key)
+MOD_MILESTONES = (
+    (2.0, "Offline Notice (2 Days)", "offline_mod_2d"),
+    (2.5, "Offline Warning (Approaching 3 Days)", "offline_mod_2_5d"),
+    (3.0, "Offline Warning", "offline_mod_3d"),
+)
+OOA_MILESTONES = (
+    (16 / 24, "Approaching 16 Hours", "offline_ooa_16h"),
+    (23 / 24, "23 Hours Offline", "offline_ooa_23h"),
+    (1.0, "Offline Warning", "offline_ooa_24h"),
+)
+
+POLICIES = {
+    "MOD": {"allowed_days": 3.0, "milestones": MOD_MILESTONES},
+    "OOA": {"allowed_days": 1.0, "milestones": OOA_MILESTONES},
+}
 
 class HabboWatch(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -150,11 +166,26 @@ class HabboWatch(commands.Cog):
             dt = dt.replace(tzinfo=timezone.utc)
         return (now - dt).total_seconds() / 86400.0
 
+    @staticmethod
+    def resolve_milestone(days_offline: float | None, milestones: tuple[tuple[float, str, str], ...]):
+        """Return the highest milestone reached for the current offline duration."""
+        if days_offline is None:
+            return None, None
+
+        reached_title = None
+        reached_key = None
+        for threshold_days, title, key in milestones:
+            if days_offline >= threshold_days:
+                reached_title = title
+                reached_key = key
+        return reached_title, reached_key
+
     def evaluate_user(
         self,
         user_json: dict,
         requested_username: str,
         offline_since_dt: datetime | None,
+        policy_name: str,
     ):
         """Build an embed from live status + tracked offline transition time.
 
@@ -194,18 +225,20 @@ class HabboWatch(commands.Cog):
                 days_offline = self.days_since(offline_since_dt)
                 last_seen_str = offline_since_dt.strftime("%Y-%m-%d %H:%M UTC")
                 lines.append(f"## Last Seen Online: {last_seen_str}")
+                allowed_days = POLICIES[policy_name]["allowed_days"]
+                lines.append(f"## Group Policy: {policy_name}")
+                lines.append(f"## Allowed Offline Window: {allowed_days:.0f} day(s)")
 
-                # Milestones requested by user: 2.0d, 2.5d, 3.0d
-                # We use these as one-shot alert keys so each is notified only once.
-                if days_offline is not None and days_offline >= 3.0:
-                    title = "Offline Warning"
-                    alert_key = "offline_3.0"
-                elif days_offline is not None and days_offline >= 2.5:
-                    title = "Offline Warning (Approaching 3 Days)"
-                    alert_key = "offline_2.5"
-                elif days_offline is not None and days_offline >= 2.0:
-                    title = "Offline Notice (2 Days)"
-                    alert_key = "offline_2.0"
+                # Alerts are sent at specific checkpoints requested by policy.
+                # We return only the highest reached checkpoint and rely on sent_alerts
+                # deduplication in periodic_check to avoid duplicate notifications.
+                milestone_title, milestone_key = self.resolve_milestone(
+                    days_offline,
+                    POLICIES[policy_name]["milestones"],
+                )
+                if milestone_title and milestone_key:
+                    title = milestone_title
+                    alert_key = milestone_key
                 else:
                     title = "Recent Activity"
                     alert_key = None
@@ -219,6 +252,8 @@ class HabboWatch(commands.Cog):
         warn_titles = (
             "Offline Notice (2 Days)",
             "Offline Warning (Approaching 3 Days)",
+            "Approaching 16 Hours",
+            "23 Hours Offline",
             "Offline Warning",
             "Profile Hidden",
         )
@@ -262,23 +297,21 @@ class HabboWatch(commands.Cog):
 
     @tasks.loop(minutes=10)
     async def periodic_check(self):
-        # Build a username -> threshold map, de-duping across groups
-        # (threshold currently unused because alerts are fixed at 2/2.5/3 days).
-        threshold_map: dict[str, float] = {}
+        # Collect memberships independently so we can apply explicit precedence.
+        # Requirement: all OOA users are also MOD, but OOA policy must win for OOA users.
+        mod_members = {u.lower() for u in await self.fetch_group_members(MOD_GROUP_ID)}
+        ooa_members = {u.lower() for u in await self.fetch_group_members(OOA_GROUP_ID)}
 
-        for group_id, threshold_days in GROUPS:
-            members = await self.fetch_group_members(group_id)
-            if not members:
-                continue
-            for username in members:
-                key = username.lower()
-                if key in threshold_map:
-                    threshold_map[key] = max(threshold_map[key], float(threshold_days))
-                else:
-                    threshold_map[key] = float(threshold_days)
+        # Build username -> policy map once.
+        user_policy_map: dict[str, str] = {}
+        for username_lc in mod_members:
+            user_policy_map[username_lc] = "MOD"
+        for username_lc in ooa_members:
+            # OOA assignment intentionally overwrites MOD assignment.
+            user_policy_map[username_lc] = "OOA"
 
         # Check each unique user once.
-        for username_lc in threshold_map:
+        for username_lc, policy_name in user_policy_map.items():
             user_json = await self.fetch_habbo_user(username_lc)
             if not user_json:
                 self._state.pop(username_lc, None)
@@ -341,6 +374,7 @@ class HabboWatch(commands.Cog):
                 user_json,
                 username_lc,
                 st.get("offline_since"),
+                policy_name,
             )
 
             # Send milestone/profile-hidden alerts only once per tracking window.
@@ -381,7 +415,10 @@ class HabboWatch(commands.Cog):
             await interaction.followup.send("Check Complete", ephemeral=True)
             return
 
-        embed, _is_online, alert_key, _name, _avatar_url = self.evaluate_user(user_json, username, None)
+        # Slash command checks are ad-hoc lookups without guaranteed group membership.
+        # We default to MOD policy for neutral display; no offline milestone fires here
+        # because this command intentionally passes offline_since_dt=None.
+        embed, _is_online, alert_key, _name, _avatar_url = self.evaluate_user(user_json, username, None, "MOD")
         if alert_key:
             await self.notify_user(embed)
 
