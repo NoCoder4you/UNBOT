@@ -295,7 +295,8 @@ class HabboWatch(commands.Cog):
         except Exception:
             pass
 
-    @tasks.loop(minutes=10)
+    # Poll every 2.5 minutes so policy milestones are detected closer to real-time.
+    @tasks.loop(minutes=2.5)
     async def periodic_check(self):
         # Collect memberships independently so we can apply explicit precedence.
         # Requirement: all OOA users are also MOD, but OOA policy must win for OOA users.
