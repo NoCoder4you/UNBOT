@@ -167,6 +167,34 @@ class HabboWatch(commands.Cog):
         return (now - dt).total_seconds() / 86400.0
 
     @staticmethod
+    def format_offline_duration(offline_since_dt: datetime | None) -> str | None:
+        """Return a human-readable elapsed duration since the user went offline."""
+        if not offline_since_dt:
+            return None
+
+        now = datetime.now(timezone.utc)
+        if offline_since_dt.tzinfo is None:
+            offline_since_dt = offline_since_dt.replace(tzinfo=timezone.utc)
+
+        elapsed_seconds = int(max(0, (now - offline_since_dt).total_seconds()))
+        days, remainder = divmod(elapsed_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days} day{'s' if days != 1 else ''}")
+        if hours:
+            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes:
+            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+
+        # If a user has just gone offline, keep output explicit instead of empty.
+        if not parts:
+            parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+        return ", ".join(parts)
+
+    @staticmethod
     def resolve_milestone(days_offline: float | None, milestones: tuple[tuple[float, str, str], ...]):
         """Return the highest milestone reached for the current offline duration."""
         if days_offline is None:
@@ -224,7 +252,11 @@ class HabboWatch(commands.Cog):
             elif offline_since_dt:
                 days_offline = self.days_since(offline_since_dt)
                 last_seen_str = offline_since_dt.strftime("%Y-%m-%d %H:%M UTC")
+                offline_duration = self.format_offline_duration(offline_since_dt)
                 lines.append(f"## Last Seen Online: {last_seen_str}")
+                if offline_duration:
+                    # Include the exact elapsed time for quick triage in alerts.
+                    lines.append(f"## Offline For: {offline_duration}")
                 allowed_days = POLICIES[policy_name]["allowed_days"]
                 lines.append(f"## Group Policy: {policy_name}")
                 lines.append(f"## Allowed Offline Window: {allowed_days:.0f} day(s)")
@@ -272,9 +304,12 @@ class HabboWatch(commands.Cog):
         if went_offline_at:
             unix_then = int(went_offline_at.timestamp())
             unix_now = int(datetime.now(timezone.utc).timestamp())
+            offline_duration = self.format_offline_duration(went_offline_at)
             # Show when they were last seen (offline start) and how long until now
             lines.append(f"## Was Offline Since: <t:{unix_then}:F>")
             lines.append(f"## Back Online: <t:{unix_now}:F>")
+            if offline_duration:
+                lines.append(f"## Total Time Offline: {offline_duration}")
         else:
             lines.append(" ")
 
