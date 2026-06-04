@@ -39,8 +39,10 @@ class HabboWatch(commands.Cog):
         bot_root = Path(__file__).resolve().parent.parent
         self.last_online_file = bot_root / "JSON" / "habbo_last_online.json"
         self.logoff_file = bot_root / "JSON" / "habbo_logoff_times.json"
+        self.offline_records_file = bot_root / "JSON" / "habbo_offline_records.json"
         self.last_online_times = self.load_last_online_times()
         self.logoff_times = self.load_logoff_times()
+        self.offline_records = self.load_offline_records()
         self.periodic_check.start()
 
     async def cog_unload(self):
@@ -98,6 +100,102 @@ class HabboWatch(commands.Cog):
         except Exception:
             pass
 
+    def load_offline_records(self) -> dict[str, dict]:
+        """Load the full offline audit log used by Discord reporting commands.
+
+        The active logoff file is intentionally tiny because it is used for alert
+        restoration. This file keeps the operator-facing audit trail: the current
+        offline window, the latest observed online timestamp, and completed
+        offline windows for each Habbo user.
+        """
+        try:
+            self.offline_records_file.parent.mkdir(parents=True, exist_ok=True)
+            if not self.offline_records_file.exists():
+                self.offline_records_file.write_text("{}", encoding="utf-8")
+                return {}
+
+            data = json.loads(self.offline_records_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+
+            records: dict[str, dict] = {}
+            for username, record in data.items():
+                if not isinstance(record, dict):
+                    continue
+
+                # Normalize the shape so older/manual edits do not break commands.
+                history = record.get("history", [])
+                if not isinstance(history, list):
+                    history = []
+
+                records[str(username).lower()] = {
+                    "display_name": str(record.get("display_name") or username),
+                    "policy": str(record.get("policy") or "Unknown"),
+                    "last_seen_online_at": record.get("last_seen_online_at") if isinstance(record.get("last_seen_online_at"), str) else None,
+                    "current_offline_since": record.get("current_offline_since") if isinstance(record.get("current_offline_since"), str) else None,
+                    "history": [entry for entry in history if isinstance(entry, dict)],
+                }
+            return records
+        except Exception:
+            pass
+        return {}
+
+    def save_offline_records(self):
+        """Persist the full offline audit log for slash-command reporting."""
+        try:
+            self.offline_records_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self.offline_records, indent=2, sort_keys=True)
+            self.offline_records_file.write_text(payload, encoding="utf-8")
+        except Exception:
+            pass
+
+    def get_or_create_offline_record(self, username_lc: str, display_name: str, policy_name: str) -> dict:
+        """Return a stable JSON-backed record bucket for one Habbo user."""
+        record = self.offline_records.setdefault(
+            username_lc,
+            {
+                "display_name": display_name,
+                "policy": policy_name,
+                "last_seen_online_at": None,
+                "current_offline_since": None,
+                "history": [],
+            },
+        )
+        record["display_name"] = display_name
+        record["policy"] = policy_name
+        record.setdefault("history", [])
+        return record
+
+    def record_online_observation(self, username_lc: str, display_name: str, policy_name: str, observed_at: datetime):
+        """Store the newest time we directly observed a user online."""
+        record = self.get_or_create_offline_record(username_lc, display_name, policy_name)
+        record["last_seen_online_at"] = observed_at.isoformat()
+
+    def record_offline_start(self, username_lc: str, display_name: str, policy_name: str, offline_since: datetime):
+        """Record the start of a currently active offline window in JSON."""
+        record = self.get_or_create_offline_record(username_lc, display_name, policy_name)
+        record["current_offline_since"] = offline_since.isoformat()
+
+    def record_offline_end(self, username_lc: str, display_name: str, policy_name: str, went_offline_at: datetime, back_online_at: datetime):
+        """Archive a completed offline window and clear the active JSON marker."""
+        record = self.get_or_create_offline_record(username_lc, display_name, policy_name)
+        if went_offline_at.tzinfo is None:
+            went_offline_at = went_offline_at.replace(tzinfo=timezone.utc)
+        if back_online_at.tzinfo is None:
+            back_online_at = back_online_at.replace(tzinfo=timezone.utc)
+
+        duration_seconds = int(max(0, (back_online_at - went_offline_at).total_seconds()))
+        record["current_offline_since"] = None
+        record["last_seen_online_at"] = back_online_at.isoformat()
+        record["history"].append(
+            {
+                "offline_since": went_offline_at.isoformat(),
+                "back_online_at": back_online_at.isoformat(),
+                "duration_seconds": duration_seconds,
+                "policy": policy_name,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
     async def fetch_json(self, url: str, params: dict | None = None) -> dict | list | None:
         try:
@@ -193,6 +291,89 @@ class HabboWatch(commands.Cog):
         if not parts:
             parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
         return ", ".join(parts)
+
+
+    @staticmethod
+    def format_duration_seconds(total_seconds: int | None) -> str:
+        """Return a human-readable duration from a saved number of seconds."""
+        if total_seconds is None:
+            return "Unknown"
+
+        total_seconds = max(0, int(total_seconds))
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days} day{'s' if days != 1 else ''}")
+        if hours:
+            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes:
+            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        if not parts:
+            parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def split_usernames(usernames: str) -> list[str]:
+        """Split comma/space/newline separated Habbo usernames for operator commands."""
+        cleaned = usernames.replace(",", " ").replace("\n", " ")
+        return [part.strip() for part in cleaned.split(" ") if part.strip()]
+
+    def build_offline_times_embed(self, usernames: list[str], include_history: bool) -> discord.Embed:
+        """Build a Discord embed summarizing saved offline times for specific users."""
+        embed = discord.Embed(
+            title="Recorded Habbo Offline Times",
+            description="These times come from the bot's JSON audit file and only include users observed by the watcher.",
+            colour=discord.Colour.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text=f"{self.bot.user.name} - Siren - Noah")
+
+        for username in usernames[:20]:
+            username_lc = username.lower()
+            record = self.offline_records.get(username_lc, {})
+            display_name = record.get("display_name") or username
+            lines: list[str] = []
+
+            current_since = self.parse_iso(record.get("current_offline_since")) or self.parse_iso(self.logoff_times.get(username_lc))
+            if current_since:
+                unix_since = int(current_since.timestamp())
+                current_duration = self.format_offline_duration(current_since) or "Unknown"
+                lines.append(f"**Current Offline Since:** <t:{unix_since}:F>")
+                lines.append(f"**Current Offline For:** {current_duration}")
+            else:
+                lines.append("**Current Offline:** No active recorded offline window")
+
+            last_seen_online = self.parse_iso(record.get("last_seen_online_at"))
+            if last_seen_online:
+                lines.append(f"**Last Seen Online:** <t:{int(last_seen_online.timestamp())}:F>")
+
+            history = record.get("history", []) if isinstance(record.get("history"), list) else []
+            if include_history and history:
+                last_entry = history[-1]
+                offline_since = self.parse_iso(last_entry.get("offline_since"))
+                back_online_at = self.parse_iso(last_entry.get("back_online_at"))
+                duration = self.format_duration_seconds(last_entry.get("duration_seconds"))
+                if offline_since and back_online_at:
+                    lines.append("**Last Completed Offline Window:**")
+                    lines.append(f"Started: <t:{int(offline_since.timestamp())}:F>")
+                    lines.append(f"Ended: <t:{int(back_online_at.timestamp())}:F>")
+                    lines.append(f"Duration: {duration}")
+
+            if not record:
+                lines.append("No JSON record found for this user yet.")
+
+            embed.add_field(name=str(display_name), value="\n".join(lines), inline=False)
+
+        if len(usernames) > 20:
+            embed.add_field(
+                name="Limit Reached",
+                value="Only the first 20 usernames are shown to keep the Discord embed readable.",
+                inline=False,
+            )
+        return embed
 
     @staticmethod
     def resolve_milestone(days_offline: float | None, milestones: tuple[tuple[float, str, str], ...]):
@@ -366,10 +547,14 @@ class HabboWatch(commands.Cog):
 
             previous_online = st.get("was_online")
             is_online = user_json.get("online", user_json.get("isOnline")) is True
+            display_name = user_json.get("name") or username_lc
 
 
             if previous_online is None and (not is_online) and st.get("offline_since") is None:
-                restored_offline_since = self.parse_iso(self.logoff_times.get(username_lc))
+                restored_offline_since = (
+                    self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
+                    or self.parse_iso(self.logoff_times.get(username_lc))
+                )
                 if restored_offline_since:
                     st["offline_since"] = restored_offline_since
                     st["sent_alerts"] = set(st.get("sent_alerts") or [])
@@ -384,7 +569,9 @@ class HabboWatch(commands.Cog):
             # Track only observed online->offline transitions.
             if is_online:
                 # Continuously refresh last-online timestamp while online so it is durable across restarts.
-                self.last_online_times[username_lc] = datetime.now(timezone.utc).isoformat()
+                observed_at = datetime.now(timezone.utc)
+                self.last_online_times[username_lc] = observed_at.isoformat()
+                self.record_online_observation(username_lc, display_name, policy_name, observed_at)
                 state_changed = True
 
             if went_offline:
@@ -395,10 +582,18 @@ class HabboWatch(commands.Cog):
                 st["sent_alerts"] = set()
 
                 # Persist an explicit logoff timestamp for the active->offline transition.
-                self.logoff_times[username_lc] = datetime.now(timezone.utc).isoformat()
+                transition_at = datetime.now(timezone.utc)
+                self.logoff_times[username_lc] = transition_at.isoformat()
+                self.record_offline_start(username_lc, display_name, policy_name, st["offline_since"])
                 state_changed = True
             elif went_online:
                 # Returning online ends the current offline tracking window.
+                back_online_at = datetime.now(timezone.utc)
+                if went_offline_at:
+                    self.record_offline_end(username_lc, display_name, policy_name, went_offline_at, back_online_at)
+                else:
+                    self.record_online_observation(username_lc, display_name, policy_name, back_online_at)
+
                 st["offline_since"] = None
                 st["sent_alerts"] = set()
 
@@ -429,6 +624,7 @@ class HabboWatch(commands.Cog):
             if state_changed:
                 self.save_last_online_times()
                 self.save_logoff_times()
+                self.save_offline_records()
 
     @periodic_check.before_loop
     async def before_periodic(self):
@@ -459,6 +655,24 @@ class HabboWatch(commands.Cog):
             await self.notify_user(embed)
 
         await interaction.followup.send("Check Complete", ephemeral=True)
+
+    # Slash-only reporting command so staff can use Discord autocomplete/ephemeral responses.
+    @app_commands.command(name="offline_times", description="Show recorded offline times for specific Habbo users.")
+    @app_commands.describe(
+        usernames="Habbo usernames separated by commas or spaces",
+        include_history="Show each user's latest completed offline window too",
+    )
+    async def offline_times(self, interaction: discord.Interaction, usernames: str, include_history: bool = True):
+        """Slash command for operators to view JSON-recorded offline times in Discord."""
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        requested_usernames = self.split_usernames(usernames)
+
+        if not requested_usernames:
+            await interaction.followup.send("Please provide at least one Habbo username.", ephemeral=True)
+            return
+
+        embed = self.build_offline_times_embed(requested_usernames, include_history)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HabboWatch(bot))
