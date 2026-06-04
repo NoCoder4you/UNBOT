@@ -49,15 +49,23 @@ class HabboWatch(commands.Cog):
         self.periodic_check.cancel()
         await self.session.close()
 
+    @staticmethod
+    def ensure_json_file(file_path: Path):
+        """Create a JSON storage file with an empty object when it is missing.
+
+        The bot stores watcher state in files that are intentionally ignored by
+        git. This guard makes startup and later saves safe on fresh installs or
+        after an operator deletes one of the JSON files while the bot is offline.
+        """
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not file_path.exists():
+            file_path.write_text("{}", encoding="utf-8")
+
     def load_last_online_times(self) -> dict[str, str]:
         """Load persisted last-online timestamps, creating JSON storage when missing."""
         try:
-            self.last_online_file.parent.mkdir(parents=True, exist_ok=True)
-            if not self.last_online_file.exists():
-                # Create the JSON file the first time so operators can inspect/edit if needed.
-                self.last_online_file.write_text("{}", encoding="utf-8")
-                return {}
-
+            # Always create missing storage before reading so fresh installs work immediately.
+            self.ensure_json_file(self.last_online_file)
             data = json.loads(self.last_online_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 # Keep only simple string timestamp values.
@@ -69,7 +77,7 @@ class HabboWatch(commands.Cog):
     def save_last_online_times(self):
         """Persist last-online timestamps to disk after state-changing events."""
         try:
-            self.last_online_file.parent.mkdir(parents=True, exist_ok=True)
+            self.ensure_json_file(self.last_online_file)
             payload = json.dumps(self.last_online_times, indent=2, sort_keys=True)
             self.last_online_file.write_text(payload, encoding="utf-8")
         except Exception:
@@ -78,12 +86,8 @@ class HabboWatch(commands.Cog):
     def load_logoff_times(self) -> dict[str, str]:
         """Load persisted active->offline transition timestamps from JSON storage."""
         try:
-            self.logoff_file.parent.mkdir(parents=True, exist_ok=True)
-            if not self.logoff_file.exists():
-                # Create the logoff file so each tracked transition is durable and auditable.
-                self.logoff_file.write_text("{}", encoding="utf-8")
-                return {}
-
+            # Create the logoff file so each tracked transition is durable and auditable.
+            self.ensure_json_file(self.logoff_file)
             data = json.loads(self.logoff_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return {str(k).lower(): str(v) for k, v in data.items() if isinstance(v, str)}
@@ -94,7 +98,7 @@ class HabboWatch(commands.Cog):
     def save_logoff_times(self):
         """Persist active->offline transition timestamps to disk."""
         try:
-            self.logoff_file.parent.mkdir(parents=True, exist_ok=True)
+            self.ensure_json_file(self.logoff_file)
             payload = json.dumps(self.logoff_times, indent=2, sort_keys=True)
             self.logoff_file.write_text(payload, encoding="utf-8")
         except Exception:
@@ -109,11 +113,7 @@ class HabboWatch(commands.Cog):
         offline windows for each Habbo user.
         """
         try:
-            self.offline_records_file.parent.mkdir(parents=True, exist_ok=True)
-            if not self.offline_records_file.exists():
-                self.offline_records_file.write_text("{}", encoding="utf-8")
-                return {}
-
+            self.ensure_json_file(self.offline_records_file)
             data = json.loads(self.offline_records_file.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return {}
@@ -143,7 +143,7 @@ class HabboWatch(commands.Cog):
     def save_offline_records(self):
         """Persist the full offline audit log for slash-command reporting."""
         try:
-            self.offline_records_file.parent.mkdir(parents=True, exist_ok=True)
+            self.ensure_json_file(self.offline_records_file)
             payload = json.dumps(self.offline_records, indent=2, sort_keys=True)
             self.offline_records_file.write_text(payload, encoding="utf-8")
         except Exception:
