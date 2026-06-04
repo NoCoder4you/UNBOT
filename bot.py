@@ -204,10 +204,14 @@ async def restart(ctx):
         logging.error(f"Failed to restart the bot: {e}")
         await ctx.send(f"Failed to restart the bot: {e}", delete_after=5)
 
-@bot.command(name="sync")
+# Keep this prefix command away from the generic name "sync" because some
+# deployments already register that name/alias, which raises CommandRegistrationError
+# during import and stops the bot before cogs can load.
+@bot.command(name="sync_commands")
 @commands.is_owner()
-async def sync(ctx):
+async def sync_commands(ctx):
     await bot.tree.sync()
+    await ctx.send("Slash commands synced successfully.", delete_after=5)
 
 @bot.command(name="stop")
 @commands.is_owner()
