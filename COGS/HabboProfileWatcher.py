@@ -657,7 +657,7 @@ class HabboWatch(commands.Cog):
         await interaction.followup.send("Check Complete", ephemeral=True)
 
     # Slash-only reporting command so staff can use Discord autocomplete/ephemeral responses.
-    @app_commands.command(name="offline_times", description="Show recorded offline times for specific Habbo users.")
+    @app_commands.command(name="offlinetimes", description="Show recorded offline times for specific Habbo users.")
     @app_commands.describe(
         usernames="Habbo usernames separated by commas or spaces",
         include_history="Show each user's latest completed offline window too",
