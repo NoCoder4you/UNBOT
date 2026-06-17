@@ -160,25 +160,19 @@ class HabboWatch(commands.Cog):
         except Exception:
             pass
 
-    def load_alert_channel_ids(self) -> dict[str, int | None]:
-        """Load MOD/OOA alert channel routing from JSON, with env defaults as a bootstrap.
-
-        Text commands update this file so channel choices survive bot restarts.
-        Environment variables are still accepted as initial defaults for hosts that
-        already configured them before the text commands existed.
-        """
+    def load_alert_channel_ids(self) -> dict[str, list[int]]:
         defaults = {
-            "MOD": self.parse_discord_id(MOD_ALERT_CHANNEL_ID),
-            "OOA": self.parse_discord_id(OOA_ALERT_CHANNEL_ID),
+            "MOD": self.parse_discord_ids(MOD_ALERT_CHANNEL_ID),
+            "OOA": self.parse_discord_ids(OOA_ALERT_CHANNEL_ID),
         }
         try:
             self.ensure_json_file(self.alert_channels_file)
             data = json.loads(self.alert_channels_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 for policy_name in POLICIES:
-                    configured_id = self.parse_discord_id(data.get(policy_name.lower()) or data.get(policy_name))
-                    if configured_id is not None:
-                        defaults[policy_name] = configured_id
+                    configured_ids = self.parse_discord_ids(data.get(policy_name.lower()) or data.get(policy_name))
+                    if configured_ids:
+                        defaults[policy_name] = configured_ids
         except Exception:
             pass
         return defaults
@@ -188,9 +182,9 @@ class HabboWatch(commands.Cog):
         try:
             self.ensure_json_file(self.alert_channels_file)
             payload = {
-                policy_name.lower(): channel_id
-                for policy_name, channel_id in self.alert_channel_ids.items()
-                if channel_id is not None
+                policy_name.lower(): channel_ids
+                for policy_name, channel_ids in self.alert_channel_ids.items()
+                if channel_ids
             }
             self.alert_channels_file.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         except Exception:
@@ -690,7 +684,7 @@ class HabboWatch(commands.Cog):
 
     @staticmethod
     def parse_discord_id(raw_id: str | int | None) -> int | None:
-        """Return a Discord snowflake integer from configuration text when valid."""
+        """Return one Discord snowflake integer from configuration text when valid."""
         if raw_id is None:
             return None
         try:
@@ -702,45 +696,78 @@ class HabboWatch(commands.Cog):
         except (TypeError, ValueError):
             return None
 
-    def alert_channel_id_for_policy(self, policy_name: str | None) -> int | None:
-        """Resolve the optional alert channel for a watcher policy.
+    @classmethod
+    def parse_discord_ids(cls, raw_ids) -> list[int]:
+        """Return unique Discord channel IDs from strings, lists, or channel-like objects.
+
+        JSON may contain either the old single-ID shape or the newer list shape,
+        while text commands pass Discord channel objects. Supporting all three
+        keeps older configs working and makes multi-channel updates concise.
+        """
+        if raw_ids is None:
+            return []
+
+        if isinstance(raw_ids, (list, tuple, set)):
+            candidates = raw_ids
+        elif hasattr(raw_ids, "id"):
+            candidates = [getattr(raw_ids, "id")]
+        elif isinstance(raw_ids, str):
+            candidates = raw_ids.replace(",", " ").split()
+        else:
+            candidates = [raw_ids]
+
+        channel_ids: list[int] = []
+        for candidate in candidates:
+            channel_id = cls.parse_discord_id(getattr(candidate, "id", candidate))
+            if channel_id is not None and channel_id not in channel_ids:
+                channel_ids.append(channel_id)
+        return channel_ids
+
+    def alert_channel_ids_for_policy(self, policy_name: str | None) -> list[int]:
+        """Resolve all optional alert channels for a watcher policy.
 
         MOD and OOA can be routed independently by the setmod/setooa text
-        commands. Missing or invalid channel IDs intentionally return None so
-        notifications continue to use the long-standing DM fallback instead of
-        being dropped.
+        commands. Missing or invalid channel IDs intentionally return an empty
+        list so notifications continue to use the long-standing DM fallback
+        instead of being dropped.
         """
         policy = self.normalize_policy(policy_name)
         configured_channels = getattr(self, "alert_channel_ids", {})
-        return self.parse_discord_id(configured_channels.get(policy))
+        return self.parse_discord_ids(configured_channels.get(policy))
 
-    def configure_alert_channel(self, policy_name: str, raw_channel: str | int | None) -> int:
-        """Save the alert channel for one policy and return the configured channel ID.
+    def configure_alert_channels(self, policy_name: str, raw_channels) -> list[int]:
+        """Save one or more alert channels for a policy and return their IDs.
 
-        ``raw_channel`` may be a plain snowflake, a Discord channel mention, or
-        None when the operator wants to use the channel where the command ran.
+        ``raw_channels`` may include Discord channel objects, plain snowflakes,
+        channel mention text, or legacy single-ID values. The command replaces
+        the policy's channel list so operators can intentionally remove old
+        destinations by running setmod/setooa with the desired final list.
         """
-        channel_id = self.parse_discord_id(raw_channel)
-        if channel_id is None:
-            raise ValueError("Please provide a valid Discord channel or run the command in the target channel.")
+        channel_ids = self.parse_discord_ids(raw_channels)
+        if not channel_ids:
+            raise ValueError("Please provide at least one valid Discord channel or run the command in the target channel.")
 
         policy = self.normalize_policy(policy_name)
-        self.alert_channel_ids[policy] = channel_id
+        self.alert_channel_ids[policy] = channel_ids
         self.save_alert_channel_ids()
-        return channel_id
+        return channel_ids
 
     async def notify_user(self, embed: discord.Embed, policy_name: str | None = None):
-        """Send an alert to the policy channel when configured, otherwise DM Noah."""
-        channel_id = self.alert_channel_id_for_policy(policy_name)
-        if channel_id:
+        """Send an alert to every configured policy channel, otherwise DM Noah."""
+        channel_ids = self.alert_channel_ids_for_policy(policy_name)
+        sent_to_channel = False
+        for channel_id in channel_ids:
             try:
                 channel = self.bot.get_channel(channel_id) if hasattr(self.bot, "get_channel") else None
                 if channel is None:
                     channel = await self.bot.fetch_channel(channel_id)
                 await channel.send(embed=embed)
-                return
+                sent_to_channel = True
             except Exception as exc:
                 LOGGER.warning("Unable to send Habbo %s alert to channel %s: %s", policy_name, channel_id, exc)
+
+        if sent_to_channel:
+            return
 
         try:
             user = await self.bot.fetch_user(NOTIFY_USER_ID)
@@ -940,28 +967,29 @@ class HabboWatch(commands.Cog):
 
         await interaction.followup.send(message, ephemeral=True)
 
-    async def _set_policy_alert_channel(self, ctx: commands.Context, policy_name: str, channel: discord.TextChannel | None = None):
+    async def _set_policy_alert_channels(self, ctx: commands.Context, policy_name: str, channels: tuple[discord.TextChannel, ...]):
         """Shared implementation for text commands that route policy alerts."""
-        target_channel = channel or ctx.channel
+        target_channels = channels or (ctx.channel,)
         try:
-            channel_id = self.configure_alert_channel(policy_name, getattr(target_channel, "id", None))
+            channel_ids = self.configure_alert_channels(policy_name, target_channels)
         except ValueError as exc:
             await ctx.send(str(exc), delete_after=10)
             return
 
-        await ctx.send(f"{policy_name} Habbo alerts will now be sent to <#{channel_id}>.", delete_after=10)
+        mentions = ", ".join(f"<#{channel_id}>" for channel_id in channel_ids)
+        await ctx.send(f"{policy_name} Habbo alerts will now be sent to: {mentions}.", delete_after=10)
 
     @commands.command(name="setmod")
     @commands.is_owner()
-    async def set_mod_alert_channel(self, ctx: commands.Context, channel: discord.TextChannel | None = None):
-        """Set the MOD alert channel; defaults to the channel where the command is used."""
-        await self._set_policy_alert_channel(ctx, "MOD", channel)
+    async def set_mod_alert_channel(self, ctx: commands.Context, *channels: discord.TextChannel):
+        """Set one or more MOD alert channels; defaults to the current channel."""
+        await self._set_policy_alert_channels(ctx, "MOD", channels)
 
     @commands.command(name="setooa")
     @commands.is_owner()
-    async def set_ooa_alert_channel(self, ctx: commands.Context, channel: discord.TextChannel | None = None):
-        """Set the OOA alert channel; defaults to the channel where the command is used."""
-        await self._set_policy_alert_channel(ctx, "OOA", channel)
+    async def set_ooa_alert_channel(self, ctx: commands.Context, *channels: discord.TextChannel):
+        """Set one or more OOA alert channels; defaults to the current channel."""
+        await self._set_policy_alert_channels(ctx, "OOA", channels)
 
 
 async def setup(bot: commands.Bot):

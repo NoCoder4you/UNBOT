@@ -160,6 +160,8 @@ class FakeAlertBot:
 
     def get_channel(self, channel_id):
         self.requested_channel_ids.append(("get", channel_id))
+        if isinstance(self.cached_channel, dict):
+            return self.cached_channel.get(channel_id)
         return self.cached_channel
 
     async def fetch_channel(self, channel_id):
@@ -179,22 +181,22 @@ class HabboAlertRoutingTest(unittest.TestCase):
     def make_watch(self, bot):
         watch = self.watch_cls.__new__(self.watch_cls)
         watch.bot = bot
-        watch.alert_channel_ids = {"MOD": None, "OOA": None}
+        watch.alert_channel_ids = {"MOD": [], "OOA": []}
         watch.save_alert_channel_ids = lambda: None
         return watch
 
-    def test_alert_channel_id_for_policy_uses_separate_mod_and_ooa_channels(self):
+    def test_alert_channel_ids_for_policy_uses_separate_mod_and_ooa_channels(self):
         watch = self.make_watch(FakeAlertBot())
-        watch.alert_channel_ids = {"MOD": 111, "OOA": 222}
+        watch.alert_channel_ids = {"MOD": [111, 112], "OOA": [222]}
 
-        self.assertEqual(watch.alert_channel_id_for_policy("MOD"), 111)
-        self.assertEqual(watch.alert_channel_id_for_policy("ooa"), 222)
+        self.assertEqual(watch.alert_channel_ids_for_policy("MOD"), [111, 112])
+        self.assertEqual(watch.alert_channel_ids_for_policy("ooa"), [222])
 
-    def test_alert_channel_id_for_policy_ignores_invalid_channel_ids(self):
+    def test_alert_channel_ids_for_policy_ignores_invalid_channel_ids(self):
         watch = self.make_watch(FakeAlertBot())
-        watch.alert_channel_ids = {"MOD": "not-a-channel", "OOA": None}
+        watch.alert_channel_ids = {"MOD": ["not-a-channel"], "OOA": []}
 
-        self.assertIsNone(watch.alert_channel_id_for_policy("MOD"))
+        self.assertEqual(watch.alert_channel_ids_for_policy("MOD"), [])
 
     def test_notify_user_sends_to_configured_policy_channel(self):
         import asyncio
@@ -202,7 +204,7 @@ class HabboAlertRoutingTest(unittest.TestCase):
         channel = FakeAlertDestination()
         bot = FakeAlertBot(cached_channel=channel)
         watch = self.make_watch(bot)
-        watch.alert_channel_ids["MOD"] = 333
+        watch.alert_channel_ids["MOD"] = [333]
 
         asyncio.run(watch.notify_user("embed-payload", "MOD"))
 
@@ -215,23 +217,39 @@ class HabboAlertRoutingTest(unittest.TestCase):
 
         bot = FakeAlertBot()
         watch = self.make_watch(bot)
-        watch.alert_channel_ids["OOA"] = None
+        watch.alert_channel_ids["OOA"] = []
 
         asyncio.run(watch.notify_user("embed-payload", "OOA"))
 
         self.assertEqual(bot.dm_user.sent_embeds, ["embed-payload"])
         self.assertEqual(bot.requested_channel_ids, [])
 
-    def test_configure_alert_channel_accepts_channel_mentions_and_saves_policy(self):
+    def test_notify_user_sends_to_all_configured_policy_channels(self):
+        import asyncio
+
+        first_channel = FakeAlertDestination()
+        second_channel = FakeAlertDestination()
+        bot = FakeAlertBot(cached_channel={333: first_channel, 334: second_channel})
+        watch = self.make_watch(bot)
+        watch.alert_channel_ids["MOD"] = [333, 334]
+
+        asyncio.run(watch.notify_user("embed-payload", "MOD"))
+
+        self.assertEqual(first_channel.sent_embeds, ["embed-payload"])
+        self.assertEqual(second_channel.sent_embeds, ["embed-payload"])
+        self.assertEqual(bot.dm_user.sent_embeds, [])
+        self.assertEqual(bot.requested_channel_ids, [("get", 333), ("get", 334)])
+
+    def test_configure_alert_channels_accepts_multiple_mentions_and_saves_policy(self):
         saved = []
         watch = self.make_watch(FakeAlertBot())
         watch.save_alert_channel_ids = lambda: saved.append(dict(watch.alert_channel_ids))
 
-        channel_id = watch.configure_alert_channel("ooa", "<#444>")
+        channel_ids = watch.configure_alert_channels("ooa", "<#444>, <#445> <#444>")
 
-        self.assertEqual(channel_id, 444)
-        self.assertEqual(watch.alert_channel_ids["OOA"], 444)
-        self.assertEqual(saved, [{"MOD": None, "OOA": 444}])
+        self.assertEqual(channel_ids, [444, 445])
+        self.assertEqual(watch.alert_channel_ids["OOA"], [444, 445])
+        self.assertEqual(saved, [{"MOD": [], "OOA": [444, 445]}])
 
 
 if __name__ == "__main__":
