@@ -161,13 +161,6 @@ class HabboWatch(commands.Cog):
             pass
 
     def load_alert_channel_ids(self) -> dict[str, list[int]]:
-        """Load MOD/OOA alert channel routing from JSON, with env defaults as a bootstrap.
-
-        Text commands update this file so channel choices survive bot restarts.
-        Environment variables are still accepted as initial defaults for hosts that
-        already configured them before the text commands existed. Each policy now
-        stores a list so the same alert can be delivered to multiple channels.
-        """
         defaults = {
             "MOD": self.parse_discord_ids(MOD_ALERT_CHANNEL_ID),
             "OOA": self.parse_discord_ids(OOA_ALERT_CHANNEL_ID),
