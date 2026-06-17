@@ -373,6 +373,94 @@ class HabboWatch(commands.Cog):
         cleaned = usernames.replace(",", " ").replace("\n", " ")
         return [part.strip() for part in cleaned.split(" ") if part.strip()]
 
+
+    @staticmethod
+    def normalize_policy(policy_name: str | None) -> str:
+        """Return a supported watcher policy name for manual JSON edits.
+
+        Operators type this value in Discord, so the helper accepts lowercase
+        input and safely falls back to MOD instead of writing an unsupported
+        policy string into the audit JSON.
+        """
+        normalized = str(policy_name or "MOD").strip().upper()
+        return normalized if normalized in POLICIES else "MOD"
+
+    @staticmethod
+    def parse_operator_datetime(timestamp_text: str | None) -> datetime:
+        """Parse an operator-provided timestamp or default to the current UTC time.
+
+        Supported input is intentionally simple for Discord messages: ISO-8601
+        text (with either a ``T`` or a space), a trailing ``Z``, or a Unix
+        timestamp. Naive values are treated as UTC to keep the JSON consistent.
+        """
+        if not timestamp_text or not str(timestamp_text).strip():
+            return datetime.now(timezone.utc)
+
+        value = str(timestamp_text).strip()
+        parsed: datetime | None = None
+        if value.isdigit():
+            parsed = datetime.fromtimestamp(int(value), tz=timezone.utc)
+        else:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            value = value.replace(" ", "T")
+            parsed = datetime.fromisoformat(value)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def apply_manual_json_update(
+        self,
+        username: str,
+        status: str,
+        timestamp_text: str | None = None,
+        policy_name: str | None = None,
+    ) -> str:
+        """Apply a Discord-requested JSON update and return a response message.
+
+        This is the shared implementation behind the slash command so tests can
+        verify the JSON mutation without needing a live Discord connection.
+        """
+        display_name = username.strip()
+        if not display_name:
+            raise ValueError("Please provide a Habbo username.")
+
+        status_lc = status.strip().lower()
+        if status_lc not in {"online", "offline"}:
+            raise ValueError("Status must be either 'online' or 'offline'.")
+
+        policy = self.normalize_policy(policy_name)
+        observed_at = self.parse_operator_datetime(timestamp_text)
+        username_lc = display_name.lower()
+
+        if status_lc == "online":
+            # A manual online entry mirrors what the watcher records after it
+            # observes a user online: update last-online JSON and close any
+            # active offline window so future alerts start from fresh state.
+            previous_offline_since = self.parse_iso(
+                self.offline_records.get(username_lc, {}).get("current_offline_since")
+            ) or self.parse_iso(self.logoff_times.get(username_lc))
+            self.last_online_times[username_lc] = observed_at.isoformat()
+            if previous_offline_since:
+                self.record_offline_end(username_lc, display_name, policy, previous_offline_since, observed_at)
+            else:
+                self.record_online_observation(username_lc, display_name, policy, observed_at)
+            self.logoff_times.pop(username_lc, None)
+            message = f"Saved {display_name} as online at {observed_at.isoformat()} in the Habbo JSON files."
+        else:
+            # A manual offline entry creates the same durable markers that the
+            # watcher uses after an observed online->offline transition.
+            self.logoff_times[username_lc] = observed_at.isoformat()
+            self.record_offline_start(username_lc, display_name, policy, observed_at)
+            message = f"Saved {display_name} as offline since {observed_at.isoformat()} in the Habbo JSON files."
+
+        self.save_last_online_times()
+        self.save_logoff_times()
+        self.save_offline_records()
+        self._state.pop(username_lc, None)
+        return message
+
     def build_offline_times_embed(self, usernames: list[str], include_history: bool) -> discord.Embed:
         """Build a Discord embed summarizing saved offline times for specific users."""
         embed = discord.Embed(
@@ -725,6 +813,35 @@ class HabboWatch(commands.Cog):
 
         embed = self.build_offline_times_embed(requested_usernames, include_history)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="habbojson", description="Manually save a Habbo online/offline entry into the watcher JSON files.")
+    @app_commands.describe(
+        username="Habbo username to update",
+        status="Use 'online' or 'offline'",
+        timestamp="Optional ISO time or Unix timestamp; defaults to now in UTC",
+        policy="Optional policy name: MOD or OOA",
+    )
+    async def habbo_json_update(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+        status: str,
+        timestamp: str | None = None,
+        policy: str = "MOD",
+    ):
+        """Slash command that lets staff edit watcher JSON through Discord."""
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            message = self.apply_manual_json_update(username, status, timestamp, policy)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        except Exception as exc:
+            LOGGER.warning("Manual Habbo JSON update failed for %s: %s", username, exc)
+            await interaction.followup.send("I could not save that JSON update. Check the timestamp format and try again.", ephemeral=True)
+            return
+
+        await interaction.followup.send(message, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HabboWatch(bot))
