@@ -1,6 +1,7 @@
 import aiohttp
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 import discord
 from discord import app_commands
@@ -11,6 +12,8 @@ NOTIFY_USER_ID = 298121351871594497  # DM recipient
 # Group IDs supplied by the operator.
 MOD_GROUP_ID = "g-hhus-eb463e25366b3796072507bc69cbfee4"
 OOA_GROUP_ID = "g-hhus-1685c3902d4ce5c8a4fcefa160fedaa2"
+
+LOGGER = logging.getLogger(__name__)
 
 # Notification milestones by policy.
 # Tuple shape: (trigger_days_offline, embed_title, alert_key)
@@ -207,11 +210,62 @@ class HabboWatch(commands.Cog):
                 if "json" in ct:
                     return await resp.json()
                 return None
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning("Unable to fetch Habbo API JSON from %s with params %s: %s", url, params, exc)
             return None
 
+    @staticmethod
+    def extract_group_member_names(data: dict | list | None) -> list[str]:
+        """Extract Habbo names from known group-member response shapes.
+
+        Habbo's public group-member endpoint has appeared as both a bare list
+        and a paged object. Keeping the extraction in one tested helper avoids
+        dropping users when the API wraps members with pagination metadata.
+        """
+        if isinstance(data, list):
+            members = data
+        elif isinstance(data, dict):
+            members = data.get("members") or data.get("items") or data.get("data") or []
+        else:
+            members = []
+
+        usernames: list[str] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            name = member.get("name") or member.get("habboName") or member.get("username")
+            if name:
+                usernames.append(str(name))
+        return usernames
+
+    @staticmethod
+    def group_members_has_next_page(data: dict | list | None, current_page: int, names_found: int, page_size: int) -> bool:
+        """Return whether another group-member page should be requested.
+
+        Some Habbo responses include explicit page counts, while bare-list
+        responses only tell us whether the current page was full. Supporting
+        both forms prevents large groups from being truncated after page one.
+        """
+        if isinstance(data, dict):
+            total_pages = data.get("totalPages") or data.get("pageCount") or data.get("total_pages")
+            if total_pages is not None:
+                try:
+                    return current_page < int(total_pages)
+                except (TypeError, ValueError):
+                    return False
+
+            has_more = data.get("hasMore") or data.get("hasNextPage") or data.get("nextPage")
+            if has_more is not None:
+                return bool(has_more)
+
+        return names_found >= page_size
+
     async def fetch_group_members(self, group_id: str) -> list[str]:
-        """Return a list of Habbo usernames in the given group (handles basic pagination)."""
+        """Return a list of Habbo usernames in the given group.
+
+        This pulls members from the configured MOD/OOA groups only; a user's
+        total number of joined groups is not used when deciding whom to check.
+        """
         usernames: list[str] = []
         page = 1
         page_size = 100
@@ -220,15 +274,11 @@ class HabboWatch(commands.Cog):
             data = await self.fetch_json(url, params={"pageNumber": page, "pageSize": page_size})
             if not data:
                 break
-            members = data if isinstance(data, list) else data.get("members", [])
-            if not members:
+            page_usernames = self.extract_group_member_names(data)
+            if not page_usernames:
                 break
-            for m in members:
-                name = m.get("name") or m.get("habboName") or m.get("username")
-                if name:
-                    usernames.append(name)
-            total_pages = (data.get("totalPages") if isinstance(data, dict) else None) or 1
-            if page >= total_pages:
+            usernames.extend(page_usernames)
+            if not self.group_members_has_next_page(data, page, len(page_usernames), page_size):
                 break
             page += 1
         return sorted(set(usernames))
@@ -238,6 +288,8 @@ class HabboWatch(commands.Cog):
         url = "https://www.habbo.com/api/public/users"
         params = {"name": username}
         data = await self.fetch_json(url, params=params)
+        if data is None:
+            LOGGER.warning("Habbo profile lookup returned no public user for %s", username)
         return data if isinstance(data, dict) else None
 
     @staticmethod
