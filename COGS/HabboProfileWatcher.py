@@ -330,6 +330,25 @@ class HabboWatch(commands.Cog):
             LOGGER.warning("Habbo profile lookup returned no public user for %s", username)
         return data if isinstance(data, dict) else None
 
+    async def fetch_user_policy_map(self) -> dict[str, str]:
+        """Fetch all watched group members and return their effective policy.
+
+        The manual refresh command and periodic watcher must inspect the exact
+        same population. Keeping the MOD/OOA merge in one helper prevents the
+        force-upload path from accidentally checking a different user list. OOA
+        wins when a member appears in both groups because its shorter offline
+        policy is more urgent.
+        """
+        mod_members = {u.lower() for u in await self.fetch_group_members(MOD_GROUP_ID)}
+        ooa_members = {u.lower() for u in await self.fetch_group_members(OOA_GROUP_ID)}
+
+        user_policy_map: dict[str, str] = {}
+        for username_lc in mod_members:
+            user_policy_map[username_lc] = "MOD"
+        for username_lc in ooa_members:
+            user_policy_map[username_lc] = "OOA"
+        return user_policy_map
+
     @staticmethod
     def parse_iso(ts: str | None):
         if not ts:
@@ -778,18 +797,7 @@ class HabboWatch(commands.Cog):
     # Poll every 2.5 minutes so policy milestones are detected closer to real-time.
     @tasks.loop(minutes=2.5)
     async def periodic_check(self):
-        # Collect memberships independently so we can apply explicit precedence.
-        # Requirement: all OOA users are also MOD, but OOA policy must win for OOA users.
-        mod_members = {u.lower() for u in await self.fetch_group_members(MOD_GROUP_ID)}
-        ooa_members = {u.lower() for u in await self.fetch_group_members(OOA_GROUP_ID)}
-
-        # Build username -> policy map once.
-        user_policy_map: dict[str, str] = {}
-        for username_lc in mod_members:
-            user_policy_map[username_lc] = "MOD"
-        for username_lc in ooa_members:
-            # OOA assignment intentionally overwrites MOD assignment.
-            user_policy_map[username_lc] = "OOA"
+        user_policy_map = await self.fetch_user_policy_map()
 
         # Check each unique user once.
         for username_lc, policy_name in user_policy_map.items():
@@ -899,14 +907,81 @@ class HabboWatch(commands.Cog):
                 self.save_logoff_times()
                 self.save_offline_records()
 
+
+    async def force_upload_all_embeds(self) -> tuple[int, int]:
+        """Check every watched Habbo and resend their current status embed.
+
+        This is intentionally noisier than the periodic watcher: operators use
+        the manual command when they want a fresh full upload after changing
+        channels, restarting the bot, or correcting state. The method still
+        updates the in-memory baseline so the next automatic loop compares
+        against the newest status it just observed.
+        """
+        user_policy_map = await self.fetch_user_policy_map()
+        sent_count = 0
+        skipped_count = 0
+
+        for username_lc, policy_name in user_policy_map.items():
+            user_json = await self.fetch_habbo_user(username_lc)
+            if not user_json:
+                self._state.pop(username_lc, None)
+                skipped_count += 1
+                continue
+
+            st = self._state.get(
+                username_lc,
+                {"was_online": None, "offline_since": None, "sent_alerts": set()},
+            )
+            sent_alerts = st.get("sent_alerts")
+            if not isinstance(sent_alerts, set):
+                st["sent_alerts"] = set(sent_alerts or [])
+
+            is_online = user_json.get("online", user_json.get("isOnline")) is True
+            if is_online:
+                st["offline_since"] = None
+            elif st.get("offline_since") is None:
+                # Restore persisted active offline windows so the forced embed
+                # includes elapsed offline time whenever the bot has it saved.
+                st["offline_since"] = (
+                    self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
+                    or self.parse_iso(self.logoff_times.get(username_lc))
+                )
+
+            embed, _is_online, _alert_key, _name, _avatar_url = self.evaluate_user(
+                user_json,
+                username_lc,
+                st.get("offline_since"),
+                policy_name,
+            )
+            await self.notify_user(embed, policy_name)
+            sent_count += 1
+
+            st["was_online"] = is_online
+            self._state[username_lc] = st
+
+        return sent_count, skipped_count
+
     @periodic_check.before_loop
     async def before_periodic(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(name="check", description="Check a Habbo user's last seen / privacy (www.habbo.com).")
-    @app_commands.describe(username="Username")
-    async def habbo_check(self, interaction: discord.Interaction, username: str):
+    @app_commands.command(name="check", description="Check Habbo status; leave username blank to refresh every watched member.")
+    @app_commands.describe(username="Optional single username; leave blank to check everyone and upload all embeds again")
+    async def habbo_check(self, interaction: discord.Interaction, username: str | None = None):
         await interaction.response.defer(thinking=True, ephemeral=True)
+
+        if not username:
+            # Operators asked for the manual full refresh to live in /check.
+            # Leaving username blank intentionally sends every watched member's
+            # current embed again, unlike the quiet automatic periodic watcher.
+            sent_count, skipped_count = await self.force_upload_all_embeds()
+            await interaction.followup.send(
+                f"Check Complete: uploaded {sent_count} embed(s)"
+                f" and skipped {skipped_count} profile(s) that could not be fetched.",
+                ephemeral=True,
+            )
+            return
+
         user_json = await self.fetch_habbo_user(username)
         if not user_json:
             embed = discord.Embed(

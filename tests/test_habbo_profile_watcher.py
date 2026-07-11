@@ -160,6 +160,28 @@ class HabboManualJsonUpdateTest(unittest.TestCase):
             watch.apply_manual_json_update("Alpha", "away", None, "MOD")
 
 
+class FakeInteractionResponse:
+    def __init__(self):
+        self.deferred = []
+
+    async def defer(self, **kwargs):
+        self.deferred.append(kwargs)
+
+
+class FakeInteractionFollowup:
+    def __init__(self):
+        self.messages = []
+
+    async def send(self, *args, **kwargs):
+        self.messages.append((args, kwargs))
+
+
+class FakeInteraction:
+    def __init__(self):
+        self.response = FakeInteractionResponse()
+        self.followup = FakeInteractionFollowup()
+
+
 class FakeAlertDestination:
     def __init__(self):
         self.sent_embeds = []
@@ -366,6 +388,63 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.run_periodic_once(watch)
 
         self.assertEqual(watch.notifications, [("Back Online", "MOD")])
+
+    def test_check_slash_without_username_forces_full_embed_upload(self):
+        import asyncio
+
+        users = {"alpha": {"name": "Alpha", "online": True, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+        interaction = FakeInteraction()
+
+        asyncio.run(watch.habbo_check(interaction))
+
+        self.assertEqual(watch.notifications, [("Online", "MOD")])
+        self.assertEqual(interaction.response.deferred, [{"thinking": True, "ephemeral": True}])
+        self.assertEqual(
+            interaction.followup.messages,
+            [(
+                ("Check Complete: uploaded 1 embed(s) and skipped 0 profile(s) that could not be fetched.",),
+                {"ephemeral": True},
+            )],
+        )
+
+    def test_force_upload_all_embeds_sends_current_embed_for_every_member(self):
+        import asyncio
+
+        users = {
+            "alpha": {"name": "Alpha", "online": False, "profileVisible": True},
+            "bravo": {"name": "Bravo", "online": True, "profileVisible": True},
+            "charlie": {"name": "Charlie", "online": False, "profileVisible": True},
+        }
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha", "Bravo"], self.module.OOA_GROUP_ID: ["Bravo", "Charlie"]},
+            users,
+        )
+        watch.logoff_times["alpha"] = "2026-06-17T10:00:00+00:00"
+
+        sent_count, skipped_count = asyncio.run(watch.force_upload_all_embeds())
+
+        self.assertEqual(sent_count, 3)
+        self.assertEqual(skipped_count, 0)
+        self.assertEqual(len(watch.notifications), 3)
+        self.assertEqual({policy for _title, policy in watch.notifications}, {"MOD", "OOA"})
+        self.assertFalse(watch._state["alpha"]["was_online"])
+        self.assertTrue(watch._state["bravo"]["was_online"])
+
+    def test_force_upload_all_embeds_skips_profiles_that_cannot_be_fetched(self):
+        import asyncio
+
+        users = {"alpha": {"name": "Alpha", "online": True, "profileVisible": True}}
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha", "Missing"], self.module.OOA_GROUP_ID: []},
+            users,
+        )
+
+        sent_count, skipped_count = asyncio.run(watch.force_upload_all_embeds())
+
+        self.assertEqual(sent_count, 1)
+        self.assertEqual(skipped_count, 1)
+        self.assertEqual(watch.notifications, [("Online", "MOD")])
 
 
 if __name__ == "__main__":
