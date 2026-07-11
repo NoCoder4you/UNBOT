@@ -330,6 +330,28 @@ class HabboWatch(commands.Cog):
             LOGGER.warning("Habbo profile lookup returned no public user for %s", username)
         return data if isinstance(data, dict) else None
 
+    async def fetch_habbo_user_forced(self, username: str, attempts: int = 3) -> dict | None:
+        """Try a Habbo profile lookup more than once for manual forced checks.
+
+        A blank `/check` is operator-initiated and expected to inspect every
+        roster member as thoroughly as possible. Retrying each individual user
+        helps avoid treating a short-lived Habbo API hiccup as an unavailable
+        profile while still falling back to a diagnostic embed after all
+        attempts fail.
+        """
+        for attempt_number in range(1, attempts + 1):
+            user_json = await self.fetch_habbo_user(username)
+            if user_json:
+                return user_json
+            if attempt_number < attempts:
+                LOGGER.info(
+                    "Retrying Habbo profile lookup for %s after failed attempt %s/%s",
+                    username,
+                    attempt_number,
+                    attempts,
+                )
+        return None
+
     async def fetch_user_policy_map(self) -> dict[str, str]:
         """Fetch all watched group members and return their effective policy.
 
@@ -908,7 +930,7 @@ class HabboWatch(commands.Cog):
                 self.save_offline_records()
 
 
-    async def force_upload_all_embeds(self) -> tuple[int, int]:
+    async def force_upload_all_embeds(self) -> tuple[int, int, list[str]]:
         """Check every watched Habbo and resend their current status embed.
 
         This is intentionally noisier than the periodic watcher: operators use
@@ -919,13 +941,17 @@ class HabboWatch(commands.Cog):
         """
         user_policy_map = await self.fetch_user_policy_map()
         sent_count = 0
-        skipped_count = 0
+        unavailable_usernames: list[str] = []
 
         for username_lc, policy_name in user_policy_map.items():
-            user_json = await self.fetch_habbo_user(username_lc)
+            user_json = await self.fetch_habbo_user_forced(username_lc)
             if not user_json:
-                self._state.pop(username_lc, None)
-                skipped_count += 1
+                # Do not skip watched members when Habbo does not return a
+                # public profile. A fallback embed gives operators one message
+                # per roster entry while making the lookup problem visible.
+                await self.notify_user(self.make_unfetchable_profile_embed(username_lc), policy_name)
+                sent_count += 1
+                unavailable_usernames.append(username_lc)
                 continue
 
             st = self._state.get(
@@ -959,7 +985,37 @@ class HabboWatch(commands.Cog):
             st["was_online"] = is_online
             self._state[username_lc] = st
 
-        return sent_count, skipped_count
+        return sent_count, len(unavailable_usernames), unavailable_usernames
+
+    def make_unfetchable_profile_embed(self, username: str) -> discord.Embed:
+        """Build a fallback embed when Habbo profile details cannot be fetched."""
+        embed = discord.Embed(
+            title="Profile Unavailable",
+            description=(
+                f"## Habbo: {username}\n"
+                "## Last Seen: Unknown\n"
+                "## Details: Habbo did not return a public profile for this watched group member. "
+                "They may have been renamed, deleted, hidden from the public API, or the API request may have failed."
+            ),
+            colour=discord.Colour.red(),
+        )
+        embed.set_footer(text=f"{self.bot.user.name}")
+        return embed
+
+    @staticmethod
+    def format_force_check_summary(sent_count: int, unavailable_usernames: list[str]) -> str:
+        """Build the ephemeral /check result, including fallback-profile diagnostics."""
+        unavailable_count = len(unavailable_usernames)
+        message = (
+            f"Check Complete: uploaded {sent_count} embed(s)"
+            f" and used fallback profile embeds for {unavailable_count} member(s)."
+        )
+        if unavailable_usernames:
+            shown_names = ", ".join(unavailable_usernames[:10])
+            remaining_count = unavailable_count - 10
+            suffix = f" (+{remaining_count} more)" if remaining_count > 0 else ""
+            message += f" Fallbacks: {shown_names}{suffix}."
+        return message
 
     @periodic_check.before_loop
     async def before_periodic(self):
@@ -974,10 +1030,9 @@ class HabboWatch(commands.Cog):
             # Operators asked for the manual full refresh to live in /check.
             # Leaving username blank intentionally sends every watched member's
             # current embed again, unlike the quiet automatic periodic watcher.
-            sent_count, skipped_count = await self.force_upload_all_embeds()
+            sent_count, _unavailable_count, unavailable_usernames = await self.force_upload_all_embeds()
             await interaction.followup.send(
-                f"Check Complete: uploaded {sent_count} embed(s)"
-                f" and skipped {skipped_count} profile(s) that could not be fetched.",
+                self.format_force_check_summary(sent_count, unavailable_usernames),
                 ephemeral=True,
             )
             return
