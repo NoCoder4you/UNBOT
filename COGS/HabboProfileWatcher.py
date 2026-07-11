@@ -908,7 +908,7 @@ class HabboWatch(commands.Cog):
                 self.save_offline_records()
 
 
-    async def force_upload_all_embeds(self) -> tuple[int, int]:
+    async def force_upload_all_embeds(self) -> tuple[int, int, list[str]]:
         """Check every watched Habbo and resend their current status embed.
 
         This is intentionally noisier than the periodic watcher: operators use
@@ -920,12 +920,16 @@ class HabboWatch(commands.Cog):
         user_policy_map = await self.fetch_user_policy_map()
         sent_count = 0
         skipped_count = 0
+        skipped_usernames: list[str] = []
 
         for username_lc, policy_name in user_policy_map.items():
             user_json = await self.fetch_habbo_user(username_lc)
             if not user_json:
                 self._state.pop(username_lc, None)
                 skipped_count += 1
+                # Keep the exact watched name in the operator-facing summary so
+                # a manual /check explains which Habbo API lookups failed.
+                skipped_usernames.append(username_lc)
                 continue
 
             st = self._state.get(
@@ -959,7 +963,22 @@ class HabboWatch(commands.Cog):
             st["was_online"] = is_online
             self._state[username_lc] = st
 
-        return sent_count, skipped_count
+        return sent_count, skipped_count, skipped_usernames
+
+    @staticmethod
+    def format_force_check_summary(sent_count: int, skipped_usernames: list[str]) -> str:
+        """Build the ephemeral /check result, including skipped users for diagnostics."""
+        skipped_count = len(skipped_usernames)
+        message = (
+            f"Check Complete: uploaded {sent_count} embed(s)"
+            f" and skipped {skipped_count} profile(s) that could not be fetched."
+        )
+        if skipped_usernames:
+            shown_names = ", ".join(skipped_usernames[:10])
+            remaining_count = skipped_count - 10
+            suffix = f" (+{remaining_count} more)" if remaining_count > 0 else ""
+            message += f" Skipped: {shown_names}{suffix}."
+        return message
 
     @periodic_check.before_loop
     async def before_periodic(self):
@@ -974,10 +993,9 @@ class HabboWatch(commands.Cog):
             # Operators asked for the manual full refresh to live in /check.
             # Leaving username blank intentionally sends every watched member's
             # current embed again, unlike the quiet automatic periodic watcher.
-            sent_count, skipped_count = await self.force_upload_all_embeds()
+            sent_count, _skipped_count, skipped_usernames = await self.force_upload_all_embeds()
             await interaction.followup.send(
-                f"Check Complete: uploaded {sent_count} embed(s)"
-                f" and skipped {skipped_count} profile(s) that could not be fetched.",
+                self.format_force_check_summary(sent_count, skipped_usernames),
                 ephemeral=True,
             )
             return

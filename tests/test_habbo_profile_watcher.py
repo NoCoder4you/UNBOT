@@ -422,10 +422,11 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         )
         watch.logoff_times["alpha"] = "2026-06-17T10:00:00+00:00"
 
-        sent_count, skipped_count = asyncio.run(watch.force_upload_all_embeds())
+        sent_count, skipped_count, skipped_usernames = asyncio.run(watch.force_upload_all_embeds())
 
         self.assertEqual(sent_count, 3)
         self.assertEqual(skipped_count, 0)
+        self.assertEqual(skipped_usernames, [])
         self.assertEqual(len(watch.notifications), 3)
         self.assertEqual({policy for _title, policy in watch.notifications}, {"MOD", "OOA"})
         self.assertFalse(watch._state["alpha"]["was_online"])
@@ -440,11 +441,21 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
             users,
         )
 
-        sent_count, skipped_count = asyncio.run(watch.force_upload_all_embeds())
+        sent_count, skipped_count, skipped_usernames = asyncio.run(watch.force_upload_all_embeds())
 
         self.assertEqual(sent_count, 1)
         self.assertEqual(skipped_count, 1)
+        self.assertEqual(skipped_usernames, ["missing"])
         self.assertEqual(watch.notifications, [("Online", "MOD")])
+
+    def test_format_force_check_summary_lists_skipped_profiles(self):
+        message = self.watch_cls.format_force_check_summary(20, [f"user{i}" for i in range(12)])
+
+        self.assertEqual(
+            message,
+            "Check Complete: uploaded 20 embed(s) and skipped 12 profile(s) that could not be fetched. "
+            "Skipped: user0, user1, user2, user3, user4, user5, user6, user7, user8, user9 (+2 more).",
+        )
 
 
 if __name__ == "__main__":
