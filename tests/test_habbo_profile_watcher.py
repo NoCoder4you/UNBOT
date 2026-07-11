@@ -12,7 +12,24 @@ def load_watcher_module():
     sys.modules["aiohttp"] = aiohttp_stub
 
     discord_stub = types.ModuleType("discord")
-    discord_stub.Embed = object
+
+    class EmbedStub:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.title = kwargs.get("title")
+            self.description = kwargs.get("description")
+            self.fields = []
+
+        def set_thumbnail(self, **kwargs):
+            self.thumbnail = kwargs
+
+        def set_footer(self, **kwargs):
+            self.footer = kwargs
+
+        def add_field(self, **kwargs):
+            self.fields.append(kwargs)
+
+    discord_stub.Embed = EmbedStub
     discord_stub.TextChannel = object
     discord_stub.Colour = types.SimpleNamespace(
         blurple=lambda: "blurple",
@@ -250,6 +267,105 @@ class HabboAlertRoutingTest(unittest.TestCase):
         self.assertEqual(channel_ids, [444, 445])
         self.assertEqual(watch.alert_channel_ids["OOA"], [444, 445])
         self.assertEqual(saved, [{"MOD": [], "OOA": [444, 445]}])
+
+
+class HabboPeriodicNotificationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_watcher_module()
+        cls.watch_cls = cls.module.HabboWatch
+
+    def make_watch(self, members_by_group, users_by_name):
+        watch = self.watch_cls.__new__(self.watch_cls)
+        watch.bot = types.SimpleNamespace(user=types.SimpleNamespace(name="TestBot"))
+        watch._state = {}
+        watch.last_online_times = {}
+        watch.logoff_times = {}
+        watch.offline_records = {}
+        watch.notifications = []
+        watch.saved = []
+
+        async def fetch_group_members(group_id):
+            return members_by_group.get(group_id, [])
+
+        async def fetch_habbo_user(username):
+            return users_by_name.get(username.lower())
+
+        async def notify_user(embed, policy_name=None):
+            watch.notifications.append((embed.title, policy_name))
+
+        watch.fetch_group_members = fetch_group_members
+        watch.fetch_habbo_user = fetch_habbo_user
+        watch.notify_user = notify_user
+        watch.save_last_online_times = lambda: watch.saved.append("last_online")
+        watch.save_logoff_times = lambda: watch.saved.append("logoff")
+        watch.save_offline_records = lambda: watch.saved.append("offline_records")
+        return watch
+
+    def run_periodic_once(self, watch):
+        import asyncio
+
+        asyncio.run(self.watch_cls.periodic_check.func(watch))
+
+    def test_periodic_check_sends_nothing_when_statuses_do_not_change(self):
+        users = {
+            "alpha": {"name": "Alpha", "online": False, "profileVisible": True},
+            "bravo": {"name": "Bravo", "online": True, "profileVisible": True},
+        }
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha", "Bravo"], self.module.OOA_GROUP_ID: []},
+            users,
+        )
+
+        self.run_periodic_once(watch)
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [])
+
+    def test_periodic_check_checks_every_unique_member_once(self):
+        checked = []
+        users = {
+            "alpha": {"name": "Alpha", "online": True, "profileVisible": True},
+            "bravo": {"name": "Bravo", "online": False, "profileVisible": True},
+            "charlie": {"name": "Charlie", "online": True, "profileVisible": True},
+        }
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha", "Bravo"], self.module.OOA_GROUP_ID: ["Bravo", "Charlie"]},
+            users,
+        )
+
+        async def fetch_habbo_user(username):
+            checked.append(username)
+            return users[username.lower()]
+
+        watch.fetch_habbo_user = fetch_habbo_user
+        self.run_periodic_once(watch)
+
+        self.assertEqual(set(checked), {"alpha", "bravo", "charlie"})
+        self.assertEqual(len(checked), 3)
+        self.assertEqual(watch._state["bravo"]["was_online"], False)
+
+    def test_periodic_check_notifies_once_when_user_goes_offline(self):
+        users = {"alpha": {"name": "Alpha", "online": True, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+
+        self.run_periodic_once(watch)
+        users["alpha"] = {"name": "Alpha", "online": False, "profileVisible": True}
+        self.run_periodic_once(watch)
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [("Recent Activity", "MOD")])
+
+    def test_periodic_check_notifies_when_baseline_offline_user_comes_online(self):
+        users = {"alpha": {"name": "Alpha", "online": False, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+
+        self.run_periodic_once(watch)
+        users["alpha"] = {"name": "Alpha", "online": True, "profileVisible": True}
+        self.run_periodic_once(watch)
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [("Back Online", "MOD")])
 
 
 if __name__ == "__main__":

@@ -823,16 +823,22 @@ class HabboWatch(commands.Cog):
                     st["offline_since"] = restored_offline_since
                     st["sent_alerts"] = set(st.get("sent_alerts") or [])
 
-            # Transition flags are used to reset tracking only when state changes,
-            # preventing repeated alerts while status is unchanged.
+            # Establish a silent baseline the first time we see each user. The
+            # watcher must check every group member every cycle, but it should
+            # only notify after a later online-status change is observed.
+            initial_observation = previous_online is None
+
+            # Transition flags are the only paths that send Discord messages.
+            # If a member is still online or still offline, the loop updates no
+            # alert state and intentionally does nothing noisy.
             went_online = previous_online is False and is_online
             went_offline = previous_online is True and (not is_online)
             went_offline_at = st.get("offline_since")
             state_changed = False
 
-            # Track only observed online->offline transitions.
-            if is_online:
-                # Continuously refresh last-online timestamp while online so it is durable across restarts.
+            # Persist a first online observation silently so a future offline
+            # transition has a durable timestamp without spamming on startup.
+            if initial_observation and is_online:
                 observed_at = datetime.now(timezone.utc)
                 self.last_online_times[username_lc] = observed_at.isoformat()
                 self.record_online_observation(username_lc, display_name, policy_name, observed_at)
@@ -865,20 +871,23 @@ class HabboWatch(commands.Cog):
                 self.logoff_times.pop(username_lc, None)
                 state_changed = True
 
-            embed, _, alert_key, name, avatar_url = self.evaluate_user(
+            embed, _, _alert_key, name, avatar_url = self.evaluate_user(
                 user_json,
                 username_lc,
                 st.get("offline_since"),
                 policy_name,
             )
 
-            # Send milestone/profile-hidden alerts only once per tracking window.
-            if alert_key and alert_key not in st["sent_alerts"]:
+            # The bot sends messages only when someone's online status changes.
+            # Milestone/profile-hidden embeds are still built for manual checks,
+            # but the automatic watcher stays quiet while statuses are unchanged.
+            if went_offline:
                 await self.notify_user(embed, policy_name)
-                st["sent_alerts"].add(alert_key)
 
-            # Send one recovery message when user comes back online.
-            if went_online and went_offline_at:
+            # Send one recovery message for every observed offline->online change,
+            # even if the bot only has a baseline offline state and no saved
+            # offline-start timestamp yet.
+            if went_online:
                 back_embed = self.make_back_online_embed(name, avatar_url, went_offline_at)
                 await self.notify_user(back_embed, policy_name)
 
