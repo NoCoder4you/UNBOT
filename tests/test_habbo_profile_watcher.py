@@ -100,6 +100,24 @@ class HabboGroupMemberHelpersTest(unittest.TestCase):
         self.assertEqual(self.watch.extract_group_member_names(bare_list), ["Alpha", "Bravo", "Charlie"])
         self.assertEqual(self.watch.extract_group_member_names(wrapped), ["Delta"])
 
+
+    def test_fetch_user_policy_map_preserves_roster_casing_for_lookup(self):
+        import asyncio
+
+        watch = self.watch.__new__(self.watch)
+
+        async def fetch_group_members(group_id):
+            if group_id == self.module.MOD_GROUP_ID:
+                return ["iLegendaryGOAT"]
+            return []
+
+        watch.fetch_group_members = fetch_group_members
+
+        self.assertEqual(
+            asyncio.run(watch.fetch_user_policy_map()),
+            {"ilegendarygoat": ("iLegendaryGOAT", "MOD")},
+        )
+
     def test_group_members_has_next_page_uses_metadata_or_full_page(self):
         self.assertTrue(self.watch.group_members_has_next_page({"totalPages": 3}, 2, 40, 100))
         self.assertFalse(self.watch.group_members_has_next_page({"totalPages": 3}, 3, 40, 100))
@@ -364,7 +382,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         watch.fetch_habbo_user = fetch_habbo_user
         self.run_periodic_once(watch)
 
-        self.assertEqual(set(checked), {"alpha", "bravo", "charlie"})
+        self.assertEqual(set(checked), {"Alpha", "Bravo", "Charlie"})
         self.assertEqual(len(checked), 3)
         self.assertEqual(watch._state["bravo"]["was_online"], False)
 
@@ -453,7 +471,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         sent_count, unavailable_count, unavailable_usernames = asyncio.run(watch.force_upload_all_embeds())
 
-        self.assertEqual(attempts, ["alpha", "alpha", "alpha"])
+        self.assertEqual(attempts, ["Alpha", "Alpha", "Alpha"])
         self.assertEqual(sent_count, 1)
         self.assertEqual(unavailable_count, 0)
         self.assertEqual(unavailable_usernames, [])
@@ -472,7 +490,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         self.assertEqual(sent_count, 2)
         self.assertEqual(unavailable_count, 1)
-        self.assertEqual(unavailable_usernames, ["missing"])
+        self.assertEqual(unavailable_usernames, ["Missing"])
         self.assertCountEqual(watch.notifications, [("Online", "MOD"), ("Profile Unavailable", "MOD")])
 
     def test_format_force_check_summary_lists_fallback_profiles(self):

@@ -352,23 +352,24 @@ class HabboWatch(commands.Cog):
                 )
         return None
 
-    async def fetch_user_policy_map(self) -> dict[str, str]:
-        """Fetch all watched group members and return their effective policy.
+    async def fetch_user_policy_map(self) -> dict[str, tuple[str, str]]:
+        """Fetch watched group members with their exact lookup name and policy.
 
-        The manual refresh command and periodic watcher must inspect the exact
-        same population. Keeping the MOD/OOA merge in one helper prevents the
-        force-upload path from accidentally checking a different user list. OOA
-        wins when a member appears in both groups because its shorter offline
-        policy is more urgent.
+        Keys stay lower-case for stable de-duplication and saved state, but the
+        value preserves the original Habbo casing from the group roster. Passing
+        the exact roster name back to Habbo avoids false "profile unavailable"
+        results caused by over-normalizing names before lookup. OOA wins when a
+        member appears in both groups because its shorter offline policy is more
+        urgent.
         """
-        mod_members = {u.lower() for u in await self.fetch_group_members(MOD_GROUP_ID)}
-        ooa_members = {u.lower() for u in await self.fetch_group_members(OOA_GROUP_ID)}
+        mod_members = await self.fetch_group_members(MOD_GROUP_ID)
+        ooa_members = await self.fetch_group_members(OOA_GROUP_ID)
 
-        user_policy_map: dict[str, str] = {}
-        for username_lc in mod_members:
-            user_policy_map[username_lc] = "MOD"
-        for username_lc in ooa_members:
-            user_policy_map[username_lc] = "OOA"
+        user_policy_map: dict[str, tuple[str, str]] = {}
+        for username in mod_members:
+            user_policy_map[username.lower()] = (username, "MOD")
+        for username in ooa_members:
+            user_policy_map[username.lower()] = (username, "OOA")
         return user_policy_map
 
     @staticmethod
@@ -822,8 +823,8 @@ class HabboWatch(commands.Cog):
         user_policy_map = await self.fetch_user_policy_map()
 
         # Check each unique user once.
-        for username_lc, policy_name in user_policy_map.items():
-            user_json = await self.fetch_habbo_user(username_lc)
+        for username_lc, (lookup_username, policy_name) in user_policy_map.items():
+            user_json = await self.fetch_habbo_user(lookup_username)
             if not user_json:
                 self._state.pop(username_lc, None)
                 continue
@@ -943,15 +944,15 @@ class HabboWatch(commands.Cog):
         sent_count = 0
         unavailable_usernames: list[str] = []
 
-        for username_lc, policy_name in user_policy_map.items():
-            user_json = await self.fetch_habbo_user_forced(username_lc)
+        for username_lc, (lookup_username, policy_name) in user_policy_map.items():
+            user_json = await self.fetch_habbo_user_forced(lookup_username)
             if not user_json:
                 # Do not skip watched members when Habbo does not return a
                 # public profile. A fallback embed gives operators one message
                 # per roster entry while making the lookup problem visible.
-                await self.notify_user(self.make_unfetchable_profile_embed(username_lc), policy_name)
+                await self.notify_user(self.make_unfetchable_profile_embed(lookup_username), policy_name)
                 sent_count += 1
-                unavailable_usernames.append(username_lc)
+                unavailable_usernames.append(lookup_username)
                 continue
 
             st = self._state.get(
