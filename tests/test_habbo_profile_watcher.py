@@ -100,6 +100,24 @@ class HabboGroupMemberHelpersTest(unittest.TestCase):
         self.assertEqual(self.watch.extract_group_member_names(bare_list), ["Alpha", "Bravo", "Charlie"])
         self.assertEqual(self.watch.extract_group_member_names(wrapped), ["Delta"])
 
+
+    def test_fetch_user_policy_map_preserves_roster_casing_for_lookup(self):
+        import asyncio
+
+        watch = self.watch.__new__(self.watch)
+
+        async def fetch_group_members(group_id):
+            if group_id == self.module.MOD_GROUP_ID:
+                return ["iLegendaryGOAT"]
+            return []
+
+        watch.fetch_group_members = fetch_group_members
+
+        self.assertEqual(
+            asyncio.run(watch.fetch_user_policy_map()),
+            {"ilegendarygoat": ("iLegendaryGOAT", "MOD")},
+        )
+
     def test_group_members_has_next_page_uses_metadata_or_full_page(self):
         self.assertTrue(self.watch.group_members_has_next_page({"totalPages": 3}, 2, 40, 100))
         self.assertFalse(self.watch.group_members_has_next_page({"totalPages": 3}, 3, 40, 100))
@@ -318,6 +336,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         watch.fetch_group_members = fetch_group_members
         watch.fetch_habbo_user = fetch_habbo_user
+        watch.fetch_habbo_user_forced = self.watch_cls.fetch_habbo_user_forced.__get__(watch, self.watch_cls)
         watch.notify_user = notify_user
         watch.save_last_online_times = lambda: watch.saved.append("last_online")
         watch.save_logoff_times = lambda: watch.saved.append("logoff")
@@ -363,7 +382,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         watch.fetch_habbo_user = fetch_habbo_user
         self.run_periodic_once(watch)
 
-        self.assertEqual(set(checked), {"alpha", "bravo", "charlie"})
+        self.assertEqual(set(checked), {"Alpha", "Bravo", "Charlie"})
         self.assertEqual(len(checked), 3)
         self.assertEqual(watch._state["bravo"]["was_online"], False)
 
@@ -403,7 +422,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(
             interaction.followup.messages,
             [(
-                ("Check Complete: uploaded 1 embed(s) and skipped 0 profile(s) that could not be fetched.",),
+                ("Check Complete: uploaded 1 embed(s) and used fallback profile embeds for 0 member(s).",),
                 {"ephemeral": True},
             )],
         )
@@ -422,16 +441,43 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         )
         watch.logoff_times["alpha"] = "2026-06-17T10:00:00+00:00"
 
-        sent_count, skipped_count = asyncio.run(watch.force_upload_all_embeds())
+        sent_count, unavailable_count, unavailable_usernames = asyncio.run(watch.force_upload_all_embeds())
 
         self.assertEqual(sent_count, 3)
-        self.assertEqual(skipped_count, 0)
+        self.assertEqual(unavailable_count, 0)
+        self.assertEqual(unavailable_usernames, [])
         self.assertEqual(len(watch.notifications), 3)
         self.assertEqual({policy for _title, policy in watch.notifications}, {"MOD", "OOA"})
         self.assertFalse(watch._state["alpha"]["was_online"])
         self.assertTrue(watch._state["bravo"]["was_online"])
 
-    def test_force_upload_all_embeds_skips_profiles_that_cannot_be_fetched(self):
+
+    def test_force_upload_all_embeds_retries_each_user_before_using_fallback(self):
+        import asyncio
+
+        attempts = []
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []},
+            {},
+        )
+
+        async def fetch_habbo_user(username):
+            attempts.append(username)
+            if len(attempts) == 3:
+                return {"name": "Alpha", "online": True, "profileVisible": True}
+            return None
+
+        watch.fetch_habbo_user = fetch_habbo_user
+
+        sent_count, unavailable_count, unavailable_usernames = asyncio.run(watch.force_upload_all_embeds())
+
+        self.assertEqual(attempts, ["Alpha", "Alpha", "Alpha"])
+        self.assertEqual(sent_count, 1)
+        self.assertEqual(unavailable_count, 0)
+        self.assertEqual(unavailable_usernames, [])
+        self.assertEqual(watch.notifications, [("Online", "MOD")])
+
+    def test_force_upload_all_embeds_uses_fallback_for_profiles_that_cannot_be_fetched(self):
         import asyncio
 
         users = {"alpha": {"name": "Alpha", "online": True, "profileVisible": True}}
@@ -440,11 +486,21 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
             users,
         )
 
-        sent_count, skipped_count = asyncio.run(watch.force_upload_all_embeds())
+        sent_count, unavailable_count, unavailable_usernames = asyncio.run(watch.force_upload_all_embeds())
 
-        self.assertEqual(sent_count, 1)
-        self.assertEqual(skipped_count, 1)
-        self.assertEqual(watch.notifications, [("Online", "MOD")])
+        self.assertEqual(sent_count, 2)
+        self.assertEqual(unavailable_count, 1)
+        self.assertEqual(unavailable_usernames, ["Missing"])
+        self.assertCountEqual(watch.notifications, [("Online", "MOD"), ("Profile Unavailable", "MOD")])
+
+    def test_format_force_check_summary_lists_fallback_profiles(self):
+        message = self.watch_cls.format_force_check_summary(20, [f"user{i}" for i in range(12)])
+
+        self.assertEqual(
+            message,
+            "Check Complete: uploaded 20 embed(s) and used fallback profile embeds for 12 member(s). "
+            "Fallbacks: user0, user1, user2, user3, user4, user5, user6, user7, user8, user9 (+2 more).",
+        )
 
 
 if __name__ == "__main__":
