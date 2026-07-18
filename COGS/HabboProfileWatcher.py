@@ -994,15 +994,16 @@ class HabboWatch(commands.Cog):
     # Poll every minute so Habbo last-access JSON corrections stay timely.
     @tasks.loop(minutes=1)
     async def periodic_check(self):
+        unavailable_usernames: list[str] = []
+
         # Check each unique watched user once using roster casing for Habbo lookups.
         for username_lc, (requested_username, policy_name) in (await self.fetch_user_policy_map()).items():
             user_json = await self.fetch_habbo_user_forced(requested_username)
             if not user_json:
-                self._state.pop(username_lc, None)
-                await self.message_error_to_owner(
-                    f"Habbo profile lookup failed for watched user {requested_username}; no status embed could be built from the API response.",
-                    dedupe_key=f"profile-lookup:{username_lc}",
-                )
+                # A brief Habbo API outage can affect the entire roster at once.
+                # Keep the last known state (avoiding a false transition after
+                # recovery) and report all failures in one throttled summary.
+                unavailable_usernames.append(requested_username)
                 continue
 
             st = self._state.get(
@@ -1117,6 +1118,19 @@ class HabboWatch(commands.Cog):
                 self.save_last_online_times()
                 self.save_logoff_times()
                 self.save_offline_records()
+
+        if unavailable_usernames:
+            preview = ", ".join(unavailable_usernames[:10])
+            remaining = len(unavailable_usernames) - 10
+            if remaining > 0:
+                preview += f" (+{remaining} more)"
+            await self.message_error_to_owner(
+                f"Habbo profile lookup failed for {len(unavailable_usernames)} watched user(s) after retries: "
+                f"{preview}. Habbo may be temporarily unavailable; their last known states were preserved.",
+                # One key prevents a roster-wide outage from producing a DM per
+                # user on every minute-long watcher cycle.
+                dedupe_key="periodic-profile-lookups",
+            )
 
     @periodic_check.before_loop
     async def before_periodic(self):

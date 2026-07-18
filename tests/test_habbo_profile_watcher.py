@@ -544,10 +544,27 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(
             watch.errors,
             [(
-                "Habbo profile lookup failed for watched user Missing; no status embed could be built from the API response.",
-                {"dedupe_key": "profile-lookup:missing"},
+                "Habbo profile lookup failed for 1 watched user(s) after retries: Missing. "
+                "Habbo may be temporarily unavailable; their last known states were preserved.",
+                {"dedupe_key": "periodic-profile-lookups"},
             )],
         )
+
+    def test_periodic_check_batches_lookup_failures_and_preserves_known_state(self):
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha", "Bravo"], self.module.OOA_GROUP_ID: []},
+            {},
+        )
+        known_state = {"was_online": True, "offline_since": None, "sent_alerts": set()}
+        watch._state["alpha"] = known_state
+
+        self.run_periodic_once(watch)
+
+        self.assertIs(watch._state["alpha"], known_state)
+        self.assertEqual(len(watch.errors), 1)
+        self.assertIn("2 watched user(s)", watch.errors[0][0])
+        self.assertIn("Alpha, Bravo", watch.errors[0][0])
+        self.assertEqual(watch.errors[0][1], {"dedupe_key": "periodic-profile-lookups"})
 
     def test_periodic_check_flags_mod_milestones_while_user_stays_offline(self):
         from datetime import datetime, timedelta, timezone
