@@ -125,6 +125,11 @@ class HabboGroupMemberHelpersTest(unittest.TestCase):
         self.assertTrue(self.watch.group_members_has_next_page([{}] * 100, 1, 100, 100))
         self.assertFalse(self.watch.group_members_has_next_page([{}] * 99, 1, 99, 100))
 
+    def test_api_request_and_periodic_intervals_are_conservative(self):
+        """Guard against accidentally restoring the previous high-frequency polling."""
+        self.assertGreaterEqual(self.module.API_REQUEST_INTERVAL_SECONDS, 1.0)
+        self.assertGreaterEqual(self.module.PERIODIC_CHECK_INTERVAL_MINUTES, 5)
+
 
 class HabboManualJsonUpdateTest(unittest.TestCase):
     @classmethod
@@ -342,6 +347,9 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         watch.notifications = []
         watch.errors = []
         watch.saved = []
+        # Production retries back off to protect the API. Unit tests use zero
+        # delays so failure-path coverage remains fast and deterministic.
+        watch.profile_retry_delays = (0, 0)
 
         async def fetch_group_members(group_id):
             return members_by_group.get(group_id, [])
@@ -498,6 +506,21 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(watch.errors, [])
         self.assertTrue(watch._state["alpha"]["was_online"])
 
+    def test_profile_lookup_retries_use_configured_backoff(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        watch = self.make_watch({self.module.MOD_GROUP_ID: [], self.module.OOA_GROUP_ID: []}, {})
+        watch.profile_retry_delays = (1.0, 3.0)
+        watch.fetch_habbo_user = AsyncMock(return_value=None)
+
+        with patch.object(self.module.asyncio, "sleep", new=AsyncMock()) as sleep:
+            result = asyncio.run(watch.fetch_habbo_user_forced("Missing"))
+
+        self.assertIsNone(result)
+        self.assertEqual(watch.fetch_habbo_user.await_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.0, 3.0])
+
     def test_periodic_check_corrects_stale_offline_counter_from_newer_habbo_activity(self):
         from datetime import datetime, timedelta, timezone
 
@@ -544,10 +567,27 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(
             watch.errors,
             [(
-                "Habbo profile lookup failed for watched user Missing; no status embed could be built from the API response.",
-                {"dedupe_key": "profile-lookup:missing"},
+                "Habbo profile lookup failed for 1 watched user(s) after retries: Missing. "
+                "Habbo may be temporarily unavailable; their last known states were preserved.",
+                {"dedupe_key": "periodic-profile-lookups"},
             )],
         )
+
+    def test_periodic_check_batches_lookup_failures_and_preserves_known_state(self):
+        watch = self.make_watch(
+            {self.module.MOD_GROUP_ID: ["Alpha", "Bravo"], self.module.OOA_GROUP_ID: []},
+            {},
+        )
+        known_state = {"was_online": True, "offline_since": None, "sent_alerts": set()}
+        watch._state["alpha"] = known_state
+
+        self.run_periodic_once(watch)
+
+        self.assertIs(watch._state["alpha"], known_state)
+        self.assertEqual(len(watch.errors), 1)
+        self.assertIn("2 watched user(s)", watch.errors[0][0])
+        self.assertIn("Alpha, Bravo", watch.errors[0][0])
+        self.assertEqual(watch.errors[0][1], {"dedupe_key": "periodic-profile-lookups"})
 
     def test_periodic_check_flags_mod_milestones_while_user_stays_offline(self):
         from datetime import datetime, timedelta, timezone
