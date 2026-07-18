@@ -395,6 +395,28 @@ class HabboWatch(commands.Cog):
             dt = dt.replace(tzinfo=timezone.utc)
         return (now - dt).total_seconds() / 86400.0
 
+    @classmethod
+    def newer_habbo_last_access(cls, user_json: dict, offline_since_dt: datetime | None) -> datetime | None:
+        """Return Habbo lastAccessTime only when it corrects a stale bot time.
+
+        Bot-observed JSON remains the source used to start offline tracking. This
+        guard only moves an existing offline start forward when Habbo reports
+        later activity, preventing false multi-day alerts after missed scans or
+        state resets without inventing an offline timer for users the bot never
+        saw online.
+        """
+        if not offline_since_dt:
+            return None
+
+        habbo_last_access = cls.parse_iso(user_json.get("lastAccessTime") or user_json.get("last_access_time"))
+        if not habbo_last_access:
+            return None
+        if offline_since_dt.tzinfo is None:
+            offline_since_dt = offline_since_dt.replace(tzinfo=timezone.utc)
+        if habbo_last_access.tzinfo is None:
+            habbo_last_access = habbo_last_access.replace(tzinfo=timezone.utc)
+        return habbo_last_access if habbo_last_access > offline_since_dt else None
+
     @staticmethod
     def format_offline_duration(offline_since_dt: datetime | None) -> str | None:
         """Return a human-readable elapsed duration since the user went offline."""
@@ -858,7 +880,7 @@ class HabboWatch(commands.Cog):
 
         # Check each unique user once.
         for username_lc, (lookup_username, policy_name) in user_policy_map.items():
-            user_json = await self.fetch_habbo_user(lookup_username)
+            user_json = await self.fetch_habbo_user_forced(lookup_username)
             if not user_json:
                 self._state.pop(username_lc, None)
                 await self.message_error_to_owner(
@@ -950,6 +972,17 @@ class HabboWatch(commands.Cog):
 
                 # Clear last logoff marker once they are active again.
                 self.logoff_times.pop(username_lc, None)
+                state_changed = True
+
+            corrected_offline_since = self.newer_habbo_last_access(user_json, st.get("offline_since"))
+            if (not is_online) and corrected_offline_since:
+                # If Habbo shows a newer last access than our saved bot time,
+                # move the active offline window forward to avoid false alerts.
+                st["offline_since"] = corrected_offline_since
+                self.logoff_times[username_lc] = corrected_offline_since.isoformat()
+                self.record_offline_start(username_lc, display_name, policy_name, corrected_offline_since)
+                st["sent_alerts"] = set()
+                sent_alerts = st["sent_alerts"]
                 state_changed = True
 
             embed, _, alert_key, name, avatar_url = self.evaluate_user(
@@ -1064,6 +1097,14 @@ class HabboWatch(commands.Cog):
                     if not current_record_since:
                         self.record_offline_start(username_lc, display_name, policy_name, st["offline_since"])
                     state_changed = True
+
+            corrected_offline_since = self.newer_habbo_last_access(user_json, st.get("offline_since"))
+            if (not is_online) and corrected_offline_since:
+                # Manual /check should also correct stale JSON before posting the embed.
+                st["offline_since"] = corrected_offline_since
+                self.logoff_times[username_lc] = corrected_offline_since.isoformat()
+                self.record_offline_start(username_lc, display_name, policy_name, corrected_offline_since)
+                state_changed = True
 
             embed, _is_online, _alert_key, _name, _avatar_url = self.evaluate_user(
                 user_json,

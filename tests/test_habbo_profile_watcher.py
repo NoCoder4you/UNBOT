@@ -479,6 +479,47 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertNotIn("alpha", watch.logoff_times)
         self.assertNotIn("alpha", watch.offline_records)
 
+
+    def test_periodic_check_retries_profile_lookup_before_reporting_failure(self):
+        attempts = []
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, {})
+
+        async def fetch_habbo_user(username):
+            attempts.append(username)
+            if len(attempts) == 3:
+                return {"name": "Alpha", "online": True, "profileVisible": True}
+            return None
+
+        watch.fetch_habbo_user = fetch_habbo_user
+
+        self.run_periodic_once(watch)
+
+        self.assertEqual(attempts, ["Alpha", "Alpha", "Alpha"])
+        self.assertEqual(watch.errors, [])
+        self.assertTrue(watch._state["alpha"]["was_online"])
+
+    def test_periodic_check_corrects_stale_offline_counter_from_newer_habbo_activity(self):
+        from datetime import datetime, timedelta, timezone
+
+        saved_last_online = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        newer_last_access = (datetime.now(timezone.utc) - timedelta(hours=16)).isoformat()
+        users = {
+            "alpha": {
+                "name": "Alpha",
+                "online": False,
+                "profileVisible": True,
+                "lastAccessTime": newer_last_access,
+            }
+        }
+        watch = self.make_watch({self.module.MOD_GROUP_ID: [], self.module.OOA_GROUP_ID: ["Alpha"]}, users)
+        watch.last_online_times["alpha"] = saved_last_online
+
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [])
+        self.assertEqual(watch.logoff_times["alpha"], newer_last_access)
+        self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], newer_last_access)
+
     def test_periodic_check_messages_owner_when_profile_lookup_fails(self):
         watch = self.make_watch({self.module.MOD_GROUP_ID: ["Missing"], self.module.OOA_GROUP_ID: []}, {})
 
