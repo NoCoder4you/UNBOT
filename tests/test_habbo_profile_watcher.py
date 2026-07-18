@@ -342,6 +342,9 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         watch.notifications = []
         watch.errors = []
         watch.saved = []
+        # Production retries back off to protect the API. Unit tests use zero
+        # delays so failure-path coverage remains fast and deterministic.
+        watch.profile_retry_delays = (0, 0)
 
         async def fetch_group_members(group_id):
             return members_by_group.get(group_id, [])
@@ -497,6 +500,21 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(attempts, ["Alpha", "Alpha", "Alpha"])
         self.assertEqual(watch.errors, [])
         self.assertTrue(watch._state["alpha"]["was_online"])
+
+    def test_profile_lookup_retries_use_configured_backoff(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        watch = self.make_watch({self.module.MOD_GROUP_ID: [], self.module.OOA_GROUP_ID: []}, {})
+        watch.profile_retry_delays = (1.0, 3.0)
+        watch.fetch_habbo_user = AsyncMock(return_value=None)
+
+        with patch.object(self.module.asyncio, "sleep", new=AsyncMock()) as sleep:
+            result = asyncio.run(watch.fetch_habbo_user_forced("Missing"))
+
+        self.assertIsNone(result)
+        self.assertEqual(watch.fetch_habbo_user.await_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.0, 3.0])
 
     def test_periodic_check_corrects_stale_offline_counter_from_newer_habbo_activity(self):
         from datetime import datetime, timedelta, timezone

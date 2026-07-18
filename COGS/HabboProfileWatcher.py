@@ -1,8 +1,10 @@
 import aiohttp
+import asyncio
 from datetime import datetime, timezone
 import os
 import json
 import logging
+import time
 from pathlib import Path
 import discord
 from discord import app_commands
@@ -20,6 +22,11 @@ MOD_GROUP_ID = "g-hhus-eb463e25366b3796072507bc69cbfee4"
 OOA_GROUP_ID = "g-hhus-1685c3902d4ce5c8a4fcefa160fedaa2"
 
 LOGGER = logging.getLogger(__name__)
+
+# Keep requests below a conservative four-per-second ceiling. The watcher used
+# to send retries immediately, which could amplify a slow API into rate limits.
+API_REQUEST_INTERVAL_SECONDS = 0.25
+PROFILE_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 
 # Notification milestones by policy.
 # Tuple shape: (trigger_days_offline, embed_title, alert_key)
@@ -44,6 +51,9 @@ class HabboWatch(commands.Cog):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self._state: dict[str, dict] = {}
+        self._api_request_lock = asyncio.Lock()
+        self._next_api_request_at = 0.0
+        self.profile_retry_delays = PROFILE_RETRY_DELAYS_SECONDS
         # Resolve JSON storage from the bot root (..../UNBOT/JSON) even though this cog lives in COGS/.
         bot_root = Path(__file__).resolve().parent.parent
         self.last_online_file = bot_root / "JSON" / "habbo_last_online.json"
@@ -268,10 +278,32 @@ class HabboWatch(commands.Cog):
             }
         )
 
+    async def wait_for_api_request_slot(self):
+        """Pace all Habbo requests, including slash commands and retries."""
+        async with self._api_request_lock:
+            delay = self._next_api_request_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_api_request_at = time.monotonic() + API_REQUEST_INTERVAL_SECONDS
+
     async def fetch_json(self, url: str, params: dict | None = None) -> dict | list | None:
         try:
+            await self.wait_for_api_request_slot()
             async with self.session.get(url, params=params, timeout=20) as resp:
                 if resp.status == 404:
+                    return None
+                if resp.status == 429:
+                    # Honor Habbo's server-provided cooldown before any later
+                    # roster lookup is allowed to use the shared request slot.
+                    try:
+                        retry_after = max(1.0, float(resp.headers.get("retry-after", "1")))
+                    except (TypeError, ValueError):
+                        retry_after = 1.0
+                    self._next_api_request_at = max(
+                        self._next_api_request_at,
+                        time.monotonic() + retry_after,
+                    )
+                    LOGGER.warning("Habbo API rate limited %s; pausing requests for %.1f seconds", url, retry_after)
                     return None
                 resp.raise_for_status()
                 ct = resp.headers.get("content-type", "")
@@ -822,11 +854,16 @@ class HabboWatch(commands.Cog):
         return user_policy_map
 
     async def fetch_habbo_user_forced(self, username: str, attempts: int = 3) -> dict | None:
-        """Retry a Habbo profile lookup before treating the API result as unavailable."""
-        for _ in range(max(1, attempts)):
+        """Retry a profile lookup with backoff instead of immediately hammering Habbo."""
+        attempts = max(1, attempts)
+        retry_delays = getattr(self, "profile_retry_delays", PROFILE_RETRY_DELAYS_SECONDS)
+        for attempt_index in range(attempts):
             user_json = await self.fetch_habbo_user(username)
             if user_json:
                 return user_json
+            if attempt_index < attempts - 1 and retry_delays:
+                delay_index = min(attempt_index, len(retry_delays) - 1)
+                await asyncio.sleep(retry_delays[delay_index])
         return None
 
     async def message_error_to_owner(self, message: str, dedupe_key: str | None = None):
