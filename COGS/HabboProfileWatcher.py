@@ -42,6 +42,7 @@ class HabboWatch(commands.Cog):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self._state: dict[str, dict] = {}
+        self._last_error_notifications: dict[str, datetime] = {}
         # Resolve JSON storage from the bot root (..../UNBOT/JSON) even though this cog lives in COGS/.
         bot_root = Path(__file__).resolve().parent.parent
         self.last_online_file = bot_root / "JSON" / "habbo_last_online.json"
@@ -802,8 +803,21 @@ class HabboWatch(commands.Cog):
         embed.set_footer(text=f"{self.bot.user.name}")
         return embed
 
-    async def message_error_to_owner(self, message: str):
-        """DM every watcher error to the configured operator account."""
+    async def message_error_to_owner(self, message: str, dedupe_key: str | None = None, cooldown_seconds: int = 3600):
+        """DM watcher errors to the operator while throttling repeated noise.
+
+        The first occurrence is always sent. Repeated errors with the same key
+        are suppressed for the cooldown window so a one-minute API loop cannot
+        spam the owner during a Habbo outage or bad channel configuration.
+        """
+        now = datetime.now(timezone.utc)
+        error_key = dedupe_key or message
+        last_sent_at = getattr(self, "_last_error_notifications", {}).get(error_key)
+        if last_sent_at and (now - last_sent_at).total_seconds() < cooldown_seconds:
+            return
+
+        self._last_error_notifications = getattr(self, "_last_error_notifications", {})
+        self._last_error_notifications[error_key] = now
         try:
             user = await self.bot.fetch_user(NOTIFY_USER_ID)
             await user.send(embed=self.make_error_embed(message))
@@ -824,7 +838,8 @@ class HabboWatch(commands.Cog):
             except Exception as exc:
                 LOGGER.warning("Unable to send Habbo %s alert to channel %s: %s", policy_name, channel_id, exc)
                 await self.message_error_to_owner(
-                    f"Unable to send Habbo {policy_name or 'general'} alert to channel {channel_id}: {exc}"
+                    f"Unable to send Habbo {policy_name or 'general'} alert to channel {channel_id}: {exc}",
+                    dedupe_key=f"channel-send:{policy_name}:{channel_id}",
                 )
 
         if sent_to_channel:
@@ -847,7 +862,8 @@ class HabboWatch(commands.Cog):
             if not user_json:
                 self._state.pop(username_lc, None)
                 await self.message_error_to_owner(
-                    f"Habbo profile lookup failed for watched user {lookup_username}; no status embed could be built from the API response."
+                    f"Habbo profile lookup failed for watched user {lookup_username}; no status embed could be built from the API response.",
+                    dedupe_key=f"profile-lookup:{username_lc}",
                 )
                 continue
 
@@ -943,12 +959,9 @@ class HabboWatch(commands.Cog):
                 policy_name,
             )
 
-            # Send the initial offline-status change once, then continue quietly
-            # checking every minute until the user's policy milestone is reached.
-            if went_offline:
-                await self.notify_user(embed, policy_name)
-                if alert_key:
-                    sent_alerts.add(alert_key)
+            # To reduce spam, do not send a generic "just went offline" message.
+            # The watcher quietly counts offline time and only posts configured
+            # policy milestones, plus the recovery message when they return.
 
             # While someone remains offline, count from their saved offline start
             # and flag each policy milestone exactly once. Online users do not
@@ -1011,15 +1024,46 @@ class HabboWatch(commands.Cog):
                 st["sent_alerts"] = set(sent_alerts or [])
 
             is_online = user_json.get("online", user_json.get("isOnline")) is True
+            display_name = user_json.get("name") or lookup_username
+            state_changed = False
+
             if is_online:
+                observed_at = datetime.now(timezone.utc)
+                previous_offline_since = (
+                    st.get("offline_since")
+                    or self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
+                    or self.parse_iso(self.logoff_times.get(username_lc))
+                )
+                if previous_offline_since:
+                    # A manual /check should close stale offline windows when it
+                    # sees the user online, keeping JSON consistent after resets.
+                    self.record_offline_end(username_lc, display_name, policy_name, previous_offline_since, observed_at)
+                    self.logoff_times.pop(username_lc, None)
+                else:
+                    self.record_online_observation(username_lc, display_name, policy_name, observed_at)
+
+                self.last_online_times[username_lc] = observed_at.isoformat()
                 st["offline_since"] = None
+                st["sent_alerts"] = set()
+                state_changed = True
             elif st.get("offline_since") is None:
-                # Restore persisted active offline windows so the forced embed
-                # includes elapsed offline time whenever the bot has it saved.
-                st["offline_since"] = (
+                # Restore persisted active offline windows, or after a reset use
+                # the bot-observed last-online JSON as the offline counter start.
+                restored_active_offline_since = (
                     self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
                     or self.parse_iso(self.logoff_times.get(username_lc))
                 )
+                restored_last_online = self.parse_iso(self.last_online_times.get(username_lc))
+                st["offline_since"] = restored_active_offline_since or restored_last_online
+                if st.get("offline_since"):
+                    current_record_since = self.parse_iso(
+                        self.offline_records.get(username_lc, {}).get("current_offline_since")
+                    )
+                    if not restored_active_offline_since:
+                        self.logoff_times[username_lc] = st["offline_since"].isoformat()
+                    if not current_record_since:
+                        self.record_offline_start(username_lc, display_name, policy_name, st["offline_since"])
+                    state_changed = True
 
             embed, _is_online, _alert_key, _name, _avatar_url = self.evaluate_user(
                 user_json,
@@ -1032,6 +1076,11 @@ class HabboWatch(commands.Cog):
 
             st["was_online"] = is_online
             self._state[username_lc] = st
+
+            if state_changed:
+                self.save_last_online_times()
+                self.save_logoff_times()
+                self.save_offline_records()
 
         return sent_count, len(unavailable_usernames), unavailable_usernames
 

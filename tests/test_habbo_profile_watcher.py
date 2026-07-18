@@ -309,6 +309,23 @@ class HabboAlertRoutingTest(unittest.TestCase):
         self.assertEqual(saved, [{"MOD": [], "OOA": [444, 445]}])
 
 
+
+    def test_message_error_to_owner_throttles_repeated_error_key(self):
+        import asyncio
+
+        dm_user = FakeAlertDestination()
+        bot = FakeAlertBot(dm_user=dm_user)
+        bot.user = types.SimpleNamespace(name="TestBot")
+        watch = self.make_watch(bot)
+        watch._last_error_notifications = {}
+
+        asyncio.run(watch.message_error_to_owner("First error", dedupe_key="same-error"))
+        asyncio.run(watch.message_error_to_owner("Second error", dedupe_key="same-error"))
+
+        self.assertEqual(len(dm_user.sent_embeds), 1)
+        self.assertEqual(dm_user.sent_embeds[0].description, "First error")
+
+
 class HabboPeriodicNotificationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -335,8 +352,8 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         async def notify_user(embed, policy_name=None):
             watch.notifications.append((embed.title, policy_name))
 
-        async def message_error_to_owner(message):
-            watch.errors.append(message)
+        async def message_error_to_owner(message, **kwargs):
+            watch.errors.append((message, kwargs))
 
         watch.fetch_group_members = fetch_group_members
         watch.fetch_habbo_user = fetch_habbo_user
@@ -391,7 +408,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(len(checked), 3)
         self.assertEqual(watch._state["bravo"]["was_online"], False)
 
-    def test_periodic_check_notifies_once_when_user_goes_offline(self):
+    def test_periodic_check_stays_quiet_when_user_goes_offline_before_milestone(self):
         users = {"alpha": {"name": "Alpha", "online": True, "profileVisible": True}}
         watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
 
@@ -400,7 +417,8 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.run_periodic_once(watch)
         self.run_periodic_once(watch)
 
-        self.assertEqual(watch.notifications, [("Recent Activity", "MOD")])
+        self.assertEqual(watch.notifications, [])
+        self.assertIn("alpha", watch.logoff_times)
 
     def test_periodic_check_notifies_when_baseline_offline_user_comes_online(self):
         users = {"alpha": {"name": "Alpha", "online": False, "profileVisible": True}}
@@ -469,7 +487,10 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(watch.notifications, [])
         self.assertEqual(
             watch.errors,
-            ["Habbo profile lookup failed for watched user Missing; no status embed could be built from the API response."],
+            [(
+                "Habbo profile lookup failed for watched user Missing; no status embed could be built from the API response.",
+                {"dedupe_key": "profile-lookup:missing"},
+            )],
         )
 
     def test_periodic_check_flags_mod_milestones_while_user_stays_offline(self):
@@ -575,7 +596,35 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual({policy for _title, policy in watch.notifications}, {"MOD", "OOA"})
         self.assertFalse(watch._state["alpha"]["was_online"])
         self.assertTrue(watch._state["bravo"]["was_online"])
+        self.assertIn("bravo", watch.last_online_times)
+        self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], "2026-06-17T10:00:00+00:00")
+        self.assertIn("last_online", watch.saved)
+        self.assertIn("logoff", watch.saved)
+        self.assertIn("offline_records", watch.saved)
 
+
+
+    def test_force_upload_all_embeds_closes_offline_json_when_member_is_online(self):
+        import asyncio
+
+        users = {"alpha": {"name": "Alpha", "online": True, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+        watch.logoff_times["alpha"] = "2026-06-17T10:00:00+00:00"
+        watch.offline_records["alpha"] = {
+            "display_name": "Alpha",
+            "policy": "MOD",
+            "last_seen_online_at": None,
+            "current_offline_since": "2026-06-17T10:00:00+00:00",
+            "history": [],
+        }
+
+        sent_count, unavailable_count, unavailable_usernames = asyncio.run(watch.force_upload_all_embeds())
+
+        self.assertEqual((sent_count, unavailable_count, unavailable_usernames), (1, 0, []))
+        self.assertIn("alpha", watch.last_online_times)
+        self.assertNotIn("alpha", watch.logoff_times)
+        self.assertIsNone(watch.offline_records["alpha"]["current_offline_since"])
+        self.assertEqual(watch.offline_records["alpha"]["history"][0]["offline_since"], "2026-06-17T10:00:00+00:00")
 
     def test_force_upload_all_embeds_retries_each_user_before_using_fallback(self):
         import asyncio
@@ -619,7 +668,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertCountEqual(watch.notifications, [("Online", "MOD"), ("Profile Unavailable", "MOD")])
         self.assertEqual(
             watch.errors,
-            ["Habbo profile lookup failed for watched user Missing during forced embed upload; posted a fallback embed instead."],
+            [("Habbo profile lookup failed for watched user Missing during forced embed upload; posted a fallback embed instead.", {})],
         )
 
     def test_format_force_check_summary_lists_fallback_profiles(self):
