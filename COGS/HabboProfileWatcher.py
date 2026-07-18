@@ -25,13 +25,13 @@ LOGGER = logging.getLogger(__name__)
 # Tuple shape: (trigger_days_offline, embed_title, alert_key)
 MOD_MILESTONES = (
     (2.0, "Offline Notice (2 Days)", "offline_mod_2d"),
-    (2.5, "Offline Warning (Approaching 3 Days)", "offline_mod_2_5d"),
-    (3.0, "Offline Warning", "offline_mod_3d"),
+    (2 + 23 / 24, "Offline Warning (2 Days 23 Hours)", "offline_mod_2d_23h"),
+    (3.0, "Offline Warning (3 Days)", "offline_mod_3d"),
 )
 OOA_MILESTONES = (
     (16 / 24, "Approaching 16 Hours", "offline_ooa_16h"),
-    (23 / 24, "23 Hours Offline", "offline_ooa_23h"),
-    (1.0, "Offline Warning", "offline_ooa_24h"),
+    (23 / 24, "OOA Offline Warning (23 Hours)", "offline_ooa_23h"),
+    (1.0, "OOA Offline Warning (24 Hours)", "offline_ooa_24h"),
 )
 
 POLICIES = {
@@ -610,9 +610,9 @@ class HabboWatch(commands.Cog):
                 lines.append("## Status: Online")
             elif offline_since_dt:
                 days_offline = self.days_since(offline_since_dt)
-                last_seen_str = offline_since_dt.strftime("%Y-%m-%d %H:%M UTC")
+                last_seen_unix = int(offline_since_dt.timestamp())
                 offline_duration = self.format_offline_duration(offline_since_dt)
-                lines.append(f"## Last Seen Online: {last_seen_str}")
+                lines.append(f"## Last Seen Online: <t:{last_seen_unix}:R>")
                 if offline_duration:
                     # Include the exact elapsed time for quick triage in alerts.
                     lines.append(f"## Offline For: {offline_duration}")
@@ -642,9 +642,11 @@ class HabboWatch(commands.Cog):
 
         warn_titles = (
             "Offline Notice (2 Days)",
-            "Offline Warning (Approaching 3 Days)",
+            "Offline Warning (2 Days 23 Hours)",
+            "Offline Warning (3 Days)",
             "Approaching 16 Hours",
-            "23 Hours Offline",
+            "OOA Offline Warning (23 Hours)",
+            "OOA Offline Warning (24 Hours)",
             "Offline Warning",
             "Profile Hidden",
         )
@@ -775,27 +777,202 @@ class HabboWatch(commands.Cog):
         except Exception:
             pass
 
-    # Poll every 2.5 minutes so policy milestones are detected closer to real-time.
-    @tasks.loop(minutes=2.5)
+
+    async def fetch_user_policy_map(self) -> dict[str, tuple[str, str]]:
+        """Return every watched Habbo user with roster casing and active policy.
+
+        OOA members can also be MOD members, so OOA intentionally overwrites MOD
+        when both group rosters contain the same Habbo username.
+        """
+        user_policy_map: dict[str, tuple[str, str]] = {}
+        for username in await self.fetch_group_members(MOD_GROUP_ID):
+            user_policy_map[username.lower()] = (username, "MOD")
+        for username in await self.fetch_group_members(OOA_GROUP_ID):
+            user_policy_map[username.lower()] = (username, "OOA")
+        return user_policy_map
+
+    async def fetch_habbo_user_forced(self, username: str, attempts: int = 3) -> dict | None:
+        """Retry a Habbo profile lookup before treating the API result as unavailable."""
+        for _ in range(max(1, attempts)):
+            user_json = await self.fetch_habbo_user(username)
+            if user_json:
+                return user_json
+        return None
+
+    async def message_error_to_owner(self, message: str, dedupe_key: str | None = None):
+        """Send a throttled owner DM for watcher errors that need operator attention."""
+        now = datetime.now(timezone.utc)
+        if not hasattr(self, "_last_error_notifications"):
+            self._last_error_notifications = {}
+        if dedupe_key:
+            last_sent = self._last_error_notifications.get(dedupe_key)
+            if last_sent and (now - last_sent).total_seconds() < 3600:
+                return
+            self._last_error_notifications[dedupe_key] = now
+
+        embed = discord.Embed(
+            title="Habbo Watcher Error",
+            description=message,
+            colour=discord.Colour.red(),
+            timestamp=now,
+        )
+        embed.set_footer(text=f"{self.bot.user.name}")
+        try:
+            user = await self.bot.fetch_user(NOTIFY_USER_ID)
+            await user.send(embed=embed)
+        except Exception:
+            pass
+
+    @staticmethod
+    def parse_habbo_last_access(user_json: dict) -> datetime | None:
+        """Parse the Habbo API lastAccessTime value, if the response includes one."""
+        return HabboWatch.parse_iso(user_json.get("lastAccessTime"))
+
+    def build_json_correction_embed(self, display_name: str, policy_name: str, last_access_at: datetime) -> discord.Embed:
+        """Build the notification sent when the local JSON is corrected from Habbo."""
+        embed = discord.Embed(
+            title="Habbo JSON Corrected",
+            description=(
+                f"## Habbo: [{display_name}](https://www.habbo.com/profile/{display_name})\n"
+                f"## Group Policy: {policy_name}\n"
+                f"## Habbo Last Access: <t:{int(last_access_at.timestamp())}:F>\n"
+                "## Action: Updated the local JSON because Habbo reported newer activity."
+            ),
+            colour=discord.Colour.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text=f"{self.bot.user.name}")
+        return embed
+
+    def reconcile_last_access_for_user(self, username_lc: str, display_name: str, policy_name: str, user_json: dict) -> discord.Embed | None:
+        """Update JSON when Habbo's lastAccessTime is newer than the stored timestamp.
+
+        The comparison only moves records forward. Older or unparsable API values
+        are ignored so a transient or stale Habbo response cannot roll back JSON.
+        """
+        last_access_at = self.parse_habbo_last_access(user_json)
+        if not last_access_at:
+            return None
+        if last_access_at.tzinfo is None:
+            last_access_at = last_access_at.replace(tzinfo=timezone.utc)
+
+        stored_at = self.parse_iso(self.last_online_times.get(username_lc))
+        if stored_at and stored_at.tzinfo is None:
+            stored_at = stored_at.replace(tzinfo=timezone.utc)
+        if stored_at and stored_at >= last_access_at:
+            return None
+
+        self.last_online_times[username_lc] = last_access_at.isoformat()
+        if user_json.get("online", user_json.get("isOnline")) is True:
+            self.logoff_times.pop(username_lc, None)
+            self.record_online_observation(username_lc, display_name, policy_name, last_access_at)
+        else:
+            self.logoff_times[username_lc] = last_access_at.isoformat()
+            self.record_offline_start(username_lc, display_name, policy_name, last_access_at)
+        return self.build_json_correction_embed(display_name, policy_name, last_access_at)
+
+    async def reconcile_everyone_last_access(self) -> tuple[int, int, list[str]]:
+        """Check every watched member against Habbo lastAccessTime and save corrections."""
+        checked = 0
+        corrected = 0
+        unavailable: list[str] = []
+        for username_lc, (requested_username, policy_name) in (await self.fetch_user_policy_map()).items():
+            checked += 1
+            user_json = await self.fetch_habbo_user_forced(requested_username)
+            if not user_json:
+                unavailable.append(requested_username)
+                await self.message_error_to_owner(
+                    f"Habbo profile lookup failed for watched user {requested_username}; last-access JSON could not be verified.",
+                    dedupe_key=f"last-access:{username_lc}",
+                )
+                continue
+            display_name = user_json.get("name") or requested_username
+            embed = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
+            if embed:
+                corrected += 1
+                await self.notify_user(embed, policy_name)
+        if corrected:
+            self.save_last_online_times()
+            self.save_logoff_times()
+            self.save_offline_records()
+        return checked, corrected, unavailable
+
+    @staticmethod
+    def build_profile_unavailable_embed(username: str, policy_name: str) -> discord.Embed:
+        """Build a fallback status embed when Habbo profile lookup fails repeatedly."""
+        return discord.Embed(
+            title="Profile Unavailable",
+            description=f"## Habbo: {username}\n## Group Policy: {policy_name}\n## Details: Habbo API did not return a public profile after retries.",
+            colour=discord.Colour.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    @staticmethod
+    def format_force_check_summary(sent_count: int, unavailable_usernames: list[str]) -> str:
+        """Summarize the all-member forced check for the slash-command response."""
+        message = f"Check Complete: uploaded {sent_count} embed(s) and used fallback profile embeds for {len(unavailable_usernames)} member(s)."
+        if unavailable_usernames:
+            shown = unavailable_usernames[:10]
+            extra_count = len(unavailable_usernames) - len(shown)
+            message += f" Fallbacks: {', '.join(shown)}"
+            if extra_count:
+                message += f" (+{extra_count} more)"
+            message += "."
+        return message
+
+    async def force_upload_all_embeds(self) -> tuple[int, int, list[str]]:
+        """Upload a current status embed for every watched Habbo member."""
+        sent_count = 0
+        unavailable_usernames: list[str] = []
+        for username_lc, (requested_username, policy_name) in (await self.fetch_user_policy_map()).items():
+            user_json = await self.fetch_habbo_user_forced(requested_username)
+            if not user_json:
+                unavailable_usernames.append(requested_username)
+                await self.notify_user(self.build_profile_unavailable_embed(requested_username, policy_name), policy_name)
+                await self.message_error_to_owner(
+                    f"Habbo profile lookup failed for watched user {requested_username} during forced embed upload; posted a fallback embed instead."
+                )
+                sent_count += 1
+                continue
+
+            display_name = user_json.get("name") or requested_username
+            is_online = user_json.get("online", user_json.get("isOnline")) is True
+            st = self._state.setdefault(username_lc, {"was_online": None, "offline_since": None, "sent_alerts": set()})
+            if is_online:
+                now = datetime.now(timezone.utc)
+                previous_offline_since = self.parse_iso(self.logoff_times.get(username_lc)) or self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
+                self.last_online_times[username_lc] = now.isoformat()
+                if previous_offline_since:
+                    self.record_offline_end(username_lc, display_name, policy_name, previous_offline_since, now)
+                else:
+                    self.record_online_observation(username_lc, display_name, policy_name, now)
+                self.logoff_times.pop(username_lc, None)
+                st["offline_since"] = None
+            else:
+                st["offline_since"] = self.parse_iso(self.logoff_times.get(username_lc)) or self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
+                if st["offline_since"]:
+                    self.record_offline_start(username_lc, display_name, policy_name, st["offline_since"])
+            st["was_online"] = is_online
+            embed, *_ = self.evaluate_user(user_json, requested_username, st.get("offline_since"), policy_name)
+            await self.notify_user(embed, policy_name)
+            sent_count += 1
+        self.save_last_online_times()
+        self.save_logoff_times()
+        self.save_offline_records()
+        return sent_count, len(unavailable_usernames), unavailable_usernames
+
+    # Poll every minute so Habbo last-access JSON corrections stay timely.
+    @tasks.loop(minutes=1)
     async def periodic_check(self):
-        # Collect memberships independently so we can apply explicit precedence.
-        # Requirement: all OOA users are also MOD, but OOA policy must win for OOA users.
-        mod_members = {u.lower() for u in await self.fetch_group_members(MOD_GROUP_ID)}
-        ooa_members = {u.lower() for u in await self.fetch_group_members(OOA_GROUP_ID)}
-
-        # Build username -> policy map once.
-        user_policy_map: dict[str, str] = {}
-        for username_lc in mod_members:
-            user_policy_map[username_lc] = "MOD"
-        for username_lc in ooa_members:
-            # OOA assignment intentionally overwrites MOD assignment.
-            user_policy_map[username_lc] = "OOA"
-
-        # Check each unique user once.
-        for username_lc, policy_name in user_policy_map.items():
-            user_json = await self.fetch_habbo_user(username_lc)
+        # Check each unique watched user once using roster casing for Habbo lookups.
+        for username_lc, (requested_username, policy_name) in (await self.fetch_user_policy_map()).items():
+            user_json = await self.fetch_habbo_user_forced(requested_username)
             if not user_json:
                 self._state.pop(username_lc, None)
+                await self.message_error_to_owner(
+                    f"Habbo profile lookup failed for watched user {requested_username}; no status embed could be built from the API response.",
+                    dedupe_key=f"profile-lookup:{username_lc}",
+                )
                 continue
 
             st = self._state.get(
@@ -811,16 +988,26 @@ class HabboWatch(commands.Cog):
 
             previous_online = st.get("was_online")
             is_online = user_json.get("online", user_json.get("isOnline")) is True
-            display_name = user_json.get("name") or username_lc
+            state_changed = False
+            display_name = user_json.get("name") or requested_username
 
+            # Compare Habbo lastAccessTime to the JSON on every one-minute scan.
+            correction_embed = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
+            if correction_embed:
+                await self.notify_user(correction_embed, policy_name)
+                state_changed = True
 
             if previous_online is None and (not is_online) and st.get("offline_since") is None:
                 restored_offline_since = (
                     self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
                     or self.parse_iso(self.logoff_times.get(username_lc))
+                    or self.parse_iso(self.last_online_times.get(username_lc))
                 )
                 if restored_offline_since:
                     st["offline_since"] = restored_offline_since
+                    self.logoff_times.setdefault(username_lc, restored_offline_since.isoformat())
+                    self.record_offline_start(username_lc, display_name, policy_name, restored_offline_since)
+                    state_changed = True
                     st["sent_alerts"] = set(st.get("sent_alerts") or [])
 
             # Transition flags are used to reset tracking only when state changes,
@@ -828,7 +1015,6 @@ class HabboWatch(commands.Cog):
             went_online = previous_online is False and is_online
             went_offline = previous_online is True and (not is_online)
             went_offline_at = st.get("offline_since")
-            state_changed = False
 
             # Track only observed online->offline transitions.
             if is_online:
@@ -873,12 +1059,16 @@ class HabboWatch(commands.Cog):
             )
 
             # Send milestone/profile-hidden alerts only once per tracking window.
+            # If a correction embed was just sent, defer threshold alerts one scan
+            # so operators get a single clear JSON update notification first.
+            if correction_embed:
+                alert_key = None
             if alert_key and alert_key not in st["sent_alerts"]:
                 await self.notify_user(embed, policy_name)
                 st["sent_alerts"].add(alert_key)
 
             # Send one recovery message when user comes back online.
-            if went_online and went_offline_at:
+            if went_online:
                 back_embed = self.make_back_online_embed(name, avatar_url, went_offline_at)
                 await self.notify_user(back_embed, policy_name)
 
@@ -894,11 +1084,16 @@ class HabboWatch(commands.Cog):
     async def before_periodic(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(name="check", description="Check a Habbo user's last seen / privacy (www.habbo.com).")
-    @app_commands.describe(username="Username")
-    async def habbo_check(self, interaction: discord.Interaction, username: str):
+    @app_commands.command(name="check", description="Check one Habbo user, or leave blank to upload everyone watched.")
+    @app_commands.describe(username="Optional username; leave blank to post current embeds for everyone")
+    async def habbo_check(self, interaction: discord.Interaction, username: str | None = None):
         await interaction.response.defer(thinking=True, ephemeral=True)
-        user_json = await self.fetch_habbo_user(username)
+        if not username:
+            sent_count, _unavailable_count, unavailable_usernames = await self.force_upload_all_embeds()
+            await interaction.followup.send(self.format_force_check_summary(sent_count, unavailable_usernames), ephemeral=True)
+            return
+
+        user_json = await self.fetch_habbo_user_forced(username)
         if not user_json:
             embed = discord.Embed(
                 title="Profile Not Found",
@@ -914,11 +1109,24 @@ class HabboWatch(commands.Cog):
         # Slash command checks are ad-hoc lookups without guaranteed group membership.
         # We default to MOD policy for neutral display; no offline milestone fires here
         # because this command intentionally passes offline_since_dt=None.
-        embed, _is_online, alert_key, _name, _avatar_url = self.evaluate_user(user_json, username, None, "MOD")
-        if alert_key:
-            await self.notify_user(embed)
+        embed, _is_online, _alert_key, _name, _avatar_url = self.evaluate_user(user_json, username, None, "MOD")
+        await self.notify_user(embed)
 
         await interaction.followup.send("Check Complete", ephemeral=True)
+
+    @app_commands.command(name="habbolastaccess", description="Check everyone against Habbo last access and correct JSON.")
+    async def habbo_last_access_sync(self, interaction: discord.Interaction):
+        """Slash command for operators to run the all-member JSON reconciliation on demand."""
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        checked, corrected, unavailable = await self.reconcile_everyone_last_access()
+        message = f"Checked {checked} watched member(s) and corrected {corrected} JSON record(s)."
+        if unavailable:
+            shown = unavailable[:10]
+            message += f" Could not verify: {', '.join(shown)}"
+            if len(unavailable) > len(shown):
+                message += f" (+{len(unavailable) - len(shown)} more)"
+            message += "."
+        await interaction.followup.send(message, ephemeral=True)
 
     # Slash-only reporting command so staff can use Discord autocomplete/ephemeral responses.
     @app_commands.command(name="offlinetimes", description="Show recorded offline times for specific Habbo users.")
