@@ -475,9 +475,9 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         self.run_periodic_once(watch)
 
-        self.assertEqual(watch.notifications, [])
-        self.assertNotIn("alpha", watch.logoff_times)
-        self.assertNotIn("alpha", watch.offline_records)
+        self.assertEqual(watch.notifications, [("Habbo JSON Corrected", "MOD")])
+        self.assertIn("alpha", watch.logoff_times)
+        self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], users["alpha"]["lastAccessTime"])
 
 
     def test_periodic_check_retries_profile_lookup_before_reporting_failure(self):
@@ -516,9 +516,24 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         self.run_periodic_once(watch)
 
-        self.assertEqual(watch.notifications, [])
+        self.assertEqual(watch.notifications, [("Habbo JSON Corrected", "OOA")])
         self.assertEqual(watch.logoff_times["alpha"], newer_last_access)
         self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], newer_last_access)
+
+    def test_last_access_slash_reconciles_every_member_and_reports_counts(self):
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        newer_last_access = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        users = {"alpha": {"name": "Alpha", "online": False, "profileVisible": True, "lastAccessTime": newer_last_access}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+        interaction = FakeInteraction()
+
+        asyncio.run(watch.habbo_last_access_sync(interaction))
+
+        self.assertEqual(watch.notifications, [("Habbo JSON Corrected", "MOD")])
+        self.assertEqual(watch.last_online_times["alpha"], newer_last_access)
+        self.assertEqual(interaction.followup.messages, [(('Checked 1 watched member(s) and corrected 1 JSON record(s).',), {'ephemeral': True})])
 
     def test_periodic_check_messages_owner_when_profile_lookup_fails(self):
         watch = self.make_watch({self.module.MOD_GROUP_ID: ["Missing"], self.module.OOA_GROUP_ID: []}, {})
