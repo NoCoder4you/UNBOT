@@ -125,6 +125,11 @@ class HabboGroupMemberHelpersTest(unittest.TestCase):
         self.assertTrue(self.watch.group_members_has_next_page([{}] * 100, 1, 100, 100))
         self.assertFalse(self.watch.group_members_has_next_page([{}] * 99, 1, 99, 100))
 
+    def test_api_request_and_periodic_intervals_are_conservative(self):
+        """Guard against accidentally restoring the previous high-frequency polling."""
+        self.assertGreaterEqual(self.module.API_REQUEST_INTERVAL_SECONDS, 1.0)
+        self.assertGreaterEqual(self.module.PERIODIC_CHECK_INTERVAL_MINUTES, 5)
+
 
 class HabboManualJsonUpdateTest(unittest.TestCase):
     @classmethod

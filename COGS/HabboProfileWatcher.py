@@ -23,9 +23,11 @@ OOA_GROUP_ID = "g-hhus-1685c3902d4ce5c8a4fcefa160fedaa2"
 
 LOGGER = logging.getLogger(__name__)
 
-# Keep requests below a conservative four-per-second ceiling. The watcher used
-# to send retries immediately, which could amplify a slow API into rate limits.
-API_REQUEST_INTERVAL_SECONDS = 0.25
+# Send at most one request per second. Combined with the five-minute watcher
+# cycle below, this substantially reduces routine traffic while still detecting
+# status changes promptly enough for the shortest (16-hour) policy milestone.
+API_REQUEST_INTERVAL_SECONDS = 1.0
+PERIODIC_CHECK_INTERVAL_MINUTES = 5
 PROFILE_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 
 # Notification milestones by policy.
@@ -1028,8 +1030,9 @@ class HabboWatch(commands.Cog):
         self.save_offline_records()
         return sent_count, len(unavailable_usernames), unavailable_usernames
 
-    # Poll every minute so Habbo last-access JSON corrections stay timely.
-    @tasks.loop(minutes=1)
+    # Five-minute polling cuts routine group/profile traffic by 80% compared
+    # with the previous one-minute cycle, without affecting hour/day alerts.
+    @tasks.loop(minutes=PERIODIC_CHECK_INTERVAL_MINUTES)
     async def periodic_check(self):
         unavailable_usernames: list[str] = []
 
@@ -1165,7 +1168,7 @@ class HabboWatch(commands.Cog):
                 f"Habbo profile lookup failed for {len(unavailable_usernames)} watched user(s) after retries: "
                 f"{preview}. Habbo may be temporarily unavailable; their last known states were preserved.",
                 # One key prevents a roster-wide outage from producing a DM per
-                # user on every minute-long watcher cycle.
+                # user on every watcher cycle.
                 dedupe_key="periodic-profile-lookups",
             )
 
