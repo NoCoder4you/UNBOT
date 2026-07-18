@@ -144,6 +144,13 @@ class HabboWatch(commands.Cog):
                     "policy": str(record.get("policy") or "Unknown"),
                     "last_seen_online_at": record.get("last_seen_online_at") if isinstance(record.get("last_seen_online_at"), str) else None,
                     "current_offline_since": record.get("current_offline_since") if isinstance(record.get("current_offline_since"), str) else None,
+                    # Persist alert keys for the active offline window so a bot
+                    # restart does not post the same milestone embed again.
+                    "sent_alerts": [
+                        str(alert_key)
+                        for alert_key in record.get("sent_alerts", [])
+                        if isinstance(alert_key, str)
+                    ] if isinstance(record.get("sent_alerts"), list) else [],
                     "history": [entry for entry in history if isinstance(entry, dict)],
                 }
             return records
@@ -199,12 +206,14 @@ class HabboWatch(commands.Cog):
                 "policy": policy_name,
                 "last_seen_online_at": None,
                 "current_offline_since": None,
+                "sent_alerts": [],
                 "history": [],
             },
         )
         record["display_name"] = display_name
         record["policy"] = policy_name
         record.setdefault("history", [])
+        record.setdefault("sent_alerts", [])
         return record
 
     def record_online_observation(self, username_lc: str, display_name: str, policy_name: str, observed_at: datetime):
@@ -215,7 +224,27 @@ class HabboWatch(commands.Cog):
     def record_offline_start(self, username_lc: str, display_name: str, policy_name: str, offline_since: datetime):
         """Record the start of a currently active offline window in JSON."""
         record = self.get_or_create_offline_record(username_lc, display_name, policy_name)
-        record["current_offline_since"] = offline_since.isoformat()
+        offline_since_iso = offline_since.isoformat()
+        if record.get("current_offline_since") != offline_since_iso:
+            # A new offline window starts a fresh dedupe bucket; existing
+            # windows keep their persisted alert keys across bot restarts.
+            record["sent_alerts"] = []
+        record["current_offline_since"] = offline_since_iso
+
+    def get_persisted_sent_alerts(self, username_lc: str) -> set[str]:
+        """Return alert keys already sent for the current offline window."""
+        record = self.offline_records.get(username_lc, {})
+        sent_alerts = record.get("sent_alerts", []) if isinstance(record, dict) else []
+        if not isinstance(sent_alerts, list):
+            return set()
+        return {str(alert_key) for alert_key in sent_alerts if isinstance(alert_key, str)}
+
+    def mark_persisted_alert_sent(self, username_lc: str, display_name: str, policy_name: str, alert_key: str):
+        """Persist one sent alert key to prevent duplicate embeds after restarts."""
+        record = self.get_or_create_offline_record(username_lc, display_name, policy_name)
+        sent_alerts = self.get_persisted_sent_alerts(username_lc)
+        sent_alerts.add(alert_key)
+        record["sent_alerts"] = sorted(sent_alerts)
 
     def record_offline_end(self, username_lc: str, display_name: str, policy_name: str, went_offline_at: datetime, back_online_at: datetime):
         """Archive a completed offline window and clear the active JSON marker."""
@@ -227,6 +256,7 @@ class HabboWatch(commands.Cog):
 
         duration_seconds = int(max(0, (back_online_at - went_offline_at).total_seconds()))
         record["current_offline_since"] = None
+        record["sent_alerts"] = []
         record["last_seen_online_at"] = back_online_at.isoformat()
         record["history"].append(
             {
@@ -977,7 +1007,13 @@ class HabboWatch(commands.Cog):
 
             st = self._state.get(
                 username_lc,
-                {"was_online": None, "offline_since": None, "sent_alerts": set()},
+                {
+                    "was_online": None,
+                    "offline_since": None,
+                    # Seed dedupe state from JSON so restarting the bot does
+                    # not resend an embed for an already-reported issue.
+                    "sent_alerts": self.get_persisted_sent_alerts(username_lc),
+                },
             )
 
             # Normalize alert history to a set in case older state shape exists.
@@ -1008,7 +1044,7 @@ class HabboWatch(commands.Cog):
                     self.logoff_times.setdefault(username_lc, restored_offline_since.isoformat())
                     self.record_offline_start(username_lc, display_name, policy_name, restored_offline_since)
                     state_changed = True
-                    st["sent_alerts"] = set(st.get("sent_alerts") or [])
+                    st["sent_alerts"] = self.get_persisted_sent_alerts(username_lc)
 
             # Transition flags are used to reset tracking only when state changes,
             # preventing repeated alerts while status is unchanged.
@@ -1066,6 +1102,8 @@ class HabboWatch(commands.Cog):
             if alert_key and alert_key not in st["sent_alerts"]:
                 await self.notify_user(embed, policy_name)
                 st["sent_alerts"].add(alert_key)
+                self.mark_persisted_alert_sent(username_lc, display_name, policy_name, alert_key)
+                state_changed = True
 
             # Send one recovery message when user comes back online.
             if went_online:

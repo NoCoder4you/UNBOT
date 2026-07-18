@@ -565,6 +565,29 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         self.assertEqual(watch.notifications, [("Offline Warning (2 Days 23 Hours)", "MOD")])
         self.assertIn("offline_mod_2d_23h", watch._state["alpha"]["sent_alerts"])
+        self.assertEqual(watch.offline_records["alpha"]["sent_alerts"], ["offline_mod_2d_23h"])
+
+    def test_periodic_check_uses_persisted_alerts_to_avoid_duplicate_after_restart(self):
+        from datetime import datetime, timedelta, timezone
+
+        offline_since = (datetime.now(timezone.utc) - timedelta(days=3, minutes=5)).isoformat()
+        users = {"alpha": {"name": "Alpha", "online": False, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+        watch.offline_records["alpha"] = {
+            "display_name": "Alpha",
+            "policy": "MOD",
+            "last_seen_online_at": None,
+            "current_offline_since": offline_since,
+            "sent_alerts": ["offline_mod_3d"],
+            "history": [],
+        }
+
+        # Simulate a freshly restarted bot with empty in-memory state but JSON
+        # showing that this same offline-window milestone already notified.
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [])
+        self.assertEqual(watch._state["alpha"]["sent_alerts"], {"offline_mod_3d"})
 
     def test_periodic_check_flags_ooa_milestones_while_user_stays_offline(self):
         from datetime import datetime, timedelta, timezone
