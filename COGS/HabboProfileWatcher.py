@@ -29,6 +29,9 @@ LOGGER = logging.getLogger(__name__)
 API_REQUEST_INTERVAL_SECONDS = 1.0
 PERIODIC_CHECK_INTERVAL_MINUTES = 5
 PROFILE_RETRY_DELAYS_SECONDS = (1.0, 3.0)
+# A single failed request is common during brief Habbo API interruptions. Only
+# notify the owner after the same profile has failed across three full scans.
+PROFILE_FAILURE_ALERT_THRESHOLD = 3
 
 # Notification milestones by policy.
 # Tuple shape: (trigger_days_offline, embed_title, alert_key)
@@ -53,6 +56,7 @@ class HabboWatch(commands.Cog):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self._state: dict[str, dict] = {}
+        self._profile_failure_streaks: dict[str, int] = {}
         self._api_request_lock = asyncio.Lock()
         self._next_api_request_at = 0.0
         self.profile_retry_delays = PROFILE_RETRY_DELAYS_SECONDS
@@ -856,7 +860,12 @@ class HabboWatch(commands.Cog):
         return user_policy_map
 
     async def fetch_habbo_user_forced(self, username: str, attempts: int = 3) -> dict | None:
-        """Retry a profile lookup with backoff instead of immediately hammering Habbo."""
+        """Fetch a profile without multiplying routine watcher traffic.
+
+        Operator-driven actions retain retries for a useful immediate result.
+        Periodic scans explicitly request one attempt, while the shared API
+        limiter ensures people are checked no faster than one per second.
+        """
         attempts = max(1, attempts)
         retry_delays = getattr(self, "profile_retry_delays", PROFILE_RETRY_DELAYS_SECONDS)
         for attempt_index in range(attempts):
@@ -1020,16 +1029,26 @@ class HabboWatch(commands.Cog):
     @tasks.loop(minutes=PERIODIC_CHECK_INTERVAL_MINUTES)
     async def periodic_check(self):
         unavailable_usernames: list[str] = []
+        failure_streaks = getattr(self, "_profile_failure_streaks", {})
+        self._profile_failure_streaks = failure_streaks
 
         # Check each unique watched user once using roster casing for Habbo lookups.
         for username_lc, (requested_username, policy_name) in (await self.fetch_user_policy_map()).items():
-            user_json = await self.fetch_habbo_user_forced(requested_username)
+            # Routine scans make exactly one profile request per person. Retrying
+            # everyone during an outage only increases load and failure noise.
+            user_json = await self.fetch_habbo_user_forced(requested_username, attempts=1)
             if not user_json:
                 # A brief Habbo API outage can affect the entire roster at once.
                 # Keep the last known state (avoiding a false transition after
                 # recovery) and report all failures in one throttled summary.
-                unavailable_usernames.append(requested_username)
+                failure_streaks[username_lc] = failure_streaks.get(username_lc, 0) + 1
+                if failure_streaks[username_lc] >= PROFILE_FAILURE_ALERT_THRESHOLD:
+                    unavailable_usernames.append(requested_username)
                 continue
+
+            # A successful response ends the consecutive-failure window, so a
+            # later isolated failure does not inherit an old outage's count.
+            failure_streaks.pop(username_lc, None)
 
             st = self._state.get(
                 username_lc,
@@ -1149,7 +1168,8 @@ class HabboWatch(commands.Cog):
             if remaining > 0:
                 preview += f" (+{remaining} more)"
             await self.message_error_to_owner(
-                f"Habbo profile lookup failed for {len(unavailable_usernames)} watched user(s) after retries: "
+                f"Habbo profile lookup failed for {len(unavailable_usernames)} watched user(s) across "
+                f"{PROFILE_FAILURE_ALERT_THRESHOLD} consecutive checks: "
                 f"{preview}. Habbo may be temporarily unavailable; their last known states were preserved.",
                 # One key prevents a roster-wide outage from producing a DM per
                 # user on every watcher cycle.
