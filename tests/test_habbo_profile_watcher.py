@@ -129,6 +129,7 @@ class HabboGroupMemberHelpersTest(unittest.TestCase):
         """Guard against accidentally restoring the previous high-frequency polling."""
         self.assertGreaterEqual(self.module.API_REQUEST_INTERVAL_SECONDS, 1.0)
         self.assertGreaterEqual(self.module.PERIODIC_CHECK_INTERVAL_MINUTES, 5)
+        self.assertGreaterEqual(self.module.PROFILE_FAILURE_ALERT_THRESHOLD, 3)
 
 
 class HabboManualJsonUpdateTest(unittest.TestCase):
@@ -341,6 +342,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         watch = self.watch_cls.__new__(self.watch_cls)
         watch.bot = types.SimpleNamespace(user=types.SimpleNamespace(name="TestBot"))
         watch._state = {}
+        watch._profile_failure_streaks = {}
         watch.last_online_times = {}
         watch.logoff_times = {}
         watch.offline_records = {}
@@ -488,23 +490,20 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], users["alpha"]["lastAccessTime"])
 
 
-    def test_periodic_check_retries_profile_lookup_before_reporting_failure(self):
+    def test_periodic_check_makes_one_profile_request_per_member(self):
         attempts = []
         watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, {})
 
         async def fetch_habbo_user(username):
             attempts.append(username)
-            if len(attempts) == 3:
-                return {"name": "Alpha", "online": True, "profileVisible": True}
             return None
 
         watch.fetch_habbo_user = fetch_habbo_user
 
         self.run_periodic_once(watch)
 
-        self.assertEqual(attempts, ["Alpha", "Alpha", "Alpha"])
+        self.assertEqual(attempts, ["Alpha"])
         self.assertEqual(watch.errors, [])
-        self.assertTrue(watch._state["alpha"]["was_online"])
 
     def test_profile_lookup_retries_use_configured_backoff(self):
         import asyncio
@@ -561,13 +560,14 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
     def test_periodic_check_messages_owner_when_profile_lookup_fails(self):
         watch = self.make_watch({self.module.MOD_GROUP_ID: ["Missing"], self.module.OOA_GROUP_ID: []}, {})
 
-        self.run_periodic_once(watch)
+        for _ in range(self.module.PROFILE_FAILURE_ALERT_THRESHOLD):
+            self.run_periodic_once(watch)
 
         self.assertEqual(watch.notifications, [])
         self.assertEqual(
             watch.errors,
             [(
-                "Habbo profile lookup failed for 1 watched user(s) after retries: Missing. "
+                "Habbo profile lookup failed for 1 watched user(s) across 3 consecutive checks: Missing. "
                 "Habbo may be temporarily unavailable; their last known states were preserved.",
                 {"dedupe_key": "periodic-profile-lookups"},
             )],
@@ -581,7 +581,8 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         known_state = {"was_online": True, "offline_since": None, "sent_alerts": set()}
         watch._state["alpha"] = known_state
 
-        self.run_periodic_once(watch)
+        for _ in range(self.module.PROFILE_FAILURE_ALERT_THRESHOLD):
+            self.run_periodic_once(watch)
 
         self.assertIs(watch._state["alpha"], known_state)
         self.assertEqual(len(watch.errors), 1)
