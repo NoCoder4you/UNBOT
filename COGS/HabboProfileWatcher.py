@@ -897,23 +897,7 @@ class HabboWatch(commands.Cog):
         """Parse the Habbo API lastAccessTime value, if the response includes one."""
         return HabboWatch.parse_iso(user_json.get("lastAccessTime"))
 
-    def build_json_correction_embed(self, display_name: str, policy_name: str, last_access_at: datetime) -> discord.Embed:
-        """Build the notification sent when the local JSON is corrected from Habbo."""
-        embed = discord.Embed(
-            title="Habbo JSON Corrected",
-            description=(
-                f"## Habbo: [{display_name}](https://www.habbo.com/profile/{display_name})\n"
-                f"## Group Policy: {policy_name}\n"
-                f"## Habbo Last Access: <t:{int(last_access_at.timestamp())}:F>\n"
-                "## Action: Updated the local JSON because Habbo reported newer activity."
-            ),
-            colour=discord.Colour.green(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_footer(text=f"{self.bot.user.name}")
-        return embed
-
-    def reconcile_last_access_for_user(self, username_lc: str, display_name: str, policy_name: str, user_json: dict) -> discord.Embed | None:
+    def reconcile_last_access_for_user(self, username_lc: str, display_name: str, policy_name: str, user_json: dict) -> bool:
         """Update JSON when Habbo's lastAccessTime is newer than the stored timestamp.
 
         The comparison only moves records forward. Older or unparsable API values
@@ -921,7 +905,7 @@ class HabboWatch(commands.Cog):
         """
         last_access_at = self.parse_habbo_last_access(user_json)
         if not last_access_at:
-            return None
+            return False
         if last_access_at.tzinfo is None:
             last_access_at = last_access_at.replace(tzinfo=timezone.utc)
 
@@ -929,7 +913,7 @@ class HabboWatch(commands.Cog):
         if stored_at and stored_at.tzinfo is None:
             stored_at = stored_at.replace(tzinfo=timezone.utc)
         if stored_at and stored_at >= last_access_at:
-            return None
+            return False
 
         self.last_online_times[username_lc] = last_access_at.isoformat()
         if user_json.get("online", user_json.get("isOnline")) is True:
@@ -938,7 +922,9 @@ class HabboWatch(commands.Cog):
         else:
             self.logoff_times[username_lc] = last_access_at.isoformat()
             self.record_offline_start(username_lc, display_name, policy_name, last_access_at)
-        return self.build_json_correction_embed(display_name, policy_name, last_access_at)
+        # Reconciliation is routine bookkeeping, so report the change to the
+        # caller without producing a Discord notification for every correction.
+        return True
 
     async def reconcile_everyone_last_access(self) -> tuple[int, int, list[str]]:
         """Check every watched member against Habbo lastAccessTime and save corrections."""
@@ -956,10 +942,9 @@ class HabboWatch(commands.Cog):
                 )
                 continue
             display_name = user_json.get("name") or requested_username
-            embed = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
-            if embed:
+            was_corrected = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
+            if was_corrected:
                 corrected += 1
-                await self.notify_user(embed, policy_name)
         if corrected:
             self.save_last_online_times()
             self.save_logoff_times()
@@ -1069,9 +1054,8 @@ class HabboWatch(commands.Cog):
             display_name = user_json.get("name") or requested_username
 
             # Compare Habbo lastAccessTime to the JSON on every one-minute scan.
-            correction_embed = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
-            if correction_embed:
-                await self.notify_user(correction_embed, policy_name)
+            was_corrected = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
+            if was_corrected:
                 state_changed = True
 
             if previous_online is None and (not is_online) and st.get("offline_since") is None:
@@ -1136,9 +1120,9 @@ class HabboWatch(commands.Cog):
             )
 
             # Send milestone/profile-hidden alerts only once per tracking window.
-            # If a correction embed was just sent, defer threshold alerts one scan
-            # so operators get a single clear JSON update notification first.
-            if correction_embed:
+            # Defer a threshold alert until the next scan after reconciliation;
+            # this lets the corrected offline start drive a fresh evaluation.
+            if was_corrected:
                 alert_key = None
             if alert_key and alert_key not in st["sent_alerts"]:
                 await self.notify_user(embed, policy_name)

@@ -483,7 +483,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         self.run_periodic_once(watch)
 
-        self.assertEqual(watch.notifications, [("Habbo JSON Corrected", "MOD")])
+        self.assertEqual(watch.notifications, [])
         self.assertIn("alpha", watch.logoff_times)
         self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], users["alpha"]["lastAccessTime"])
 
@@ -539,7 +539,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         self.run_periodic_once(watch)
 
-        self.assertEqual(watch.notifications, [("Habbo JSON Corrected", "OOA")])
+        self.assertEqual(watch.notifications, [])
         self.assertEqual(watch.logoff_times["alpha"], newer_last_access)
         self.assertEqual(watch.offline_records["alpha"]["current_offline_since"], newer_last_access)
 
@@ -554,7 +554,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
 
         asyncio.run(watch.habbo_last_access_sync(interaction))
 
-        self.assertEqual(watch.notifications, [("Habbo JSON Corrected", "MOD")])
+        self.assertEqual(watch.notifications, [])
         self.assertEqual(watch.last_online_times["alpha"], newer_last_access)
         self.assertEqual(interaction.followup.messages, [(('Checked 1 watched member(s) and corrected 1 JSON record(s).',), {'ephemeral': True})])
 
