@@ -111,7 +111,6 @@ class HabboUsernameFinder(commands.Cog):
         return embed
 
     @commands.hybrid_command(name="usernamefinder", description="Check a Habbo username and close matches.")
-    @commands.cooldown(1, 30, commands.BucketType.user)
     async def username_finder(self, ctx: commands.Context, username: str):
         """Check the exact requested username plus ten nearby alternatives."""
         try:

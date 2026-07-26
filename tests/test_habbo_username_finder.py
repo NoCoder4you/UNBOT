@@ -32,9 +32,7 @@ def load_module():
     commands.Cog = object
     commands.Bot = object
     commands.Context = object
-    commands.BucketType = types.SimpleNamespace(user="user")
     commands.hybrid_command = lambda *args, **kwargs: lambda function: function
-    commands.cooldown = lambda *args, **kwargs: lambda function: function
     ext = types.ModuleType("discord.ext")
     ext.commands = commands
     sys.modules.update({"aiohttp": aiohttp, "discord": discord, "discord.ext": ext, "discord.ext.commands": commands})
