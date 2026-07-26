@@ -108,6 +108,27 @@ class HabboIdTrackerHelpersTest(unittest.TestCase):
         snapshot = {"name": "Same", "motto": "Still the same"}
         self.assertEqual(HabboIdTracker.compare_snapshots(snapshot, snapshot.copy()), {})
 
+    def test_hidden_profile_change_reports_visible_to_hidden_transition(self):
+        old = {"profileVisible": True, "online": True, "motto": "Hello"}
+        new = {"profileVisible": False, "online": False, "motto": "Goodbye"}
+
+        self.assertEqual(
+            HabboIdTracker.hidden_profile_change(old, new),
+            {"profileVisible": {"old": True, "new": False}},
+        )
+
+    def test_hidden_profile_change_ignores_online_and_other_profile_changes(self):
+        old = {"profileVisible": True, "online": True, "motto": "Hello"}
+        new = {"profileVisible": True, "online": False, "motto": "Goodbye"}
+
+        self.assertEqual(HabboIdTracker.hidden_profile_change(old, new), {})
+
+    def test_hidden_profile_change_ignores_profile_becoming_visible(self):
+        old = {"profileVisible": False}
+        new = {"profileVisible": True}
+
+        self.assertEqual(HabboIdTracker.hidden_profile_change(old, new), {})
+
 
 if __name__ == "__main__":
     unittest.main()

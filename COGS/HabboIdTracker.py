@@ -1,4 +1,4 @@
-"""Track Habbo profiles by unique ID and announce profile changes.
+"""Track Habbo profiles by unique ID and announce newly hidden profiles.
 
 The tracker deliberately uses Habbo's immutable unique ID rather than a name,
 so a rename does not cause the bot to lose the profile it is watching. Runtime
@@ -119,6 +119,26 @@ class HabboIdTracker(commands.Cog):
             if old.get(key) != new.get(key)
         }
 
+    @staticmethod
+    def hidden_profile_change(
+        old: dict[str, Any], new: dict[str, Any]
+    ) -> dict[str, dict[str, Any]]:
+        """Return the visibility change only when a public profile becomes hidden.
+
+        Online status is also represented by a boolean in the Habbo response,
+        but going offline does not mean that the user hid their profile. Keeping
+        this check tied specifically to ``profileVisible`` prevents ordinary
+        online/offline activity and unrelated edits from producing alerts.
+        """
+        if old.get("profileVisible") is not False and new.get("profileVisible") is False:
+            return {
+                "profileVisible": {
+                    "old": old.get("profileVisible"),
+                    "new": new.get("profileVisible"),
+                }
+            }
+        return {}
+
     async def fetch_profile(self, habbo_id: str) -> dict[str, Any] | None:
         """Fetch one US Habbo profile; None means unavailable/non-public."""
         url = f"https://www.habbo.com/api/public/users/{habbo_id}"
@@ -173,7 +193,7 @@ class HabboIdTracker(commands.Cog):
         return channel
 
     async def scan_profiles(self) -> int:
-        """Scan all IDs, persist snapshots/history, and post changed profiles."""
+        """Scan all IDs and post only when a visible profile becomes hidden."""
         notifications = 0
         async with self._scan_lock:
             for habbo_id in list(self.tracked_ids):
@@ -187,7 +207,9 @@ class HabboIdTracker(commands.Cog):
                 self.tracked_ids[habbo_id]["name"] = profile.get("name")
                 if old_snapshot is None:
                     continue
-                differences = self.compare_snapshots(old_snapshot, new_snapshot)
+                # Snapshot every public property for future comparisons, but
+                # alert only for the privacy transition requested by operators.
+                differences = self.hidden_profile_change(old_snapshot, new_snapshot)
                 if not differences:
                     continue
                 detected_at = datetime.now(timezone.utc).isoformat()
