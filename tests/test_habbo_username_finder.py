@@ -93,8 +93,8 @@ class HabboUsernameFinderTest(unittest.TestCase):
         self.assertIn("Example1", matches)
         self.assertIn("3xample", matches)
 
-    def test_check_username_maps_http_status_without_guessing_on_errors(self):
-        for status, expected in ((200, "taken"), (404, "available"), (500, "unknown")):
+    def test_check_username_does_not_claim_404_names_are_available(self):
+        for status, expected in ((200, "taken"), (404, "unverified"), (500, "unknown")):
             with self.subTest(status=status):
                 finder = self.finder.__new__(self.finder)
                 finder.session = Session(status)
@@ -105,11 +105,12 @@ class HabboUsernameFinderTest(unittest.TestCase):
 
     def test_build_results_embed_labels_exact_and_close_results(self):
         embed = self.finder.build_results_embed(
-            "Example", [("Example", "taken"), ("Example1", "available"), ("Example2", "unknown")]
+            "Example", [("Example", "taken"), ("Example1", "unverified"), ("Example2", "unknown")]
         )
         self.assertIn("Taken", embed.kwargs["description"])
-        self.assertIn("`Example1` — Available", embed.fields[0]["value"])
-        self.assertIn("`Example2` — Unknown", embed.fields[0]["value"])
+        self.assertIn("`Example1` — No public profile found (claimability unverified)", embed.fields[0]["value"])
+        self.assertIn("`Example2` — Could not check", embed.fields[0]["value"])
+        self.assertIn("Only Habbo registration can confirm", embed.footer["text"])
 
     def test_close_matches_prioritize_looked_up_synonyms(self):
         matches = self.finder.close_matches("FastKing", ["QuickKing", "SwiftKing", "FastRoyal"])
@@ -160,7 +161,7 @@ class HabboUsernameFinderTest(unittest.TestCase):
         finder.bot = types.SimpleNamespace(get_cog=lambda name: watcher if name == "HabboWatch" else None)
         finder.session = Session(404)
 
-        self.assertEqual(asyncio.run(finder.check_username("FastKing")), "available")
+        self.assertEqual(asyncio.run(finder.check_username("FastKing")), "unverified")
         self.assertEqual(watcher.waits, 1)
 
 

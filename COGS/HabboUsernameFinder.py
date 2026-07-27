@@ -161,17 +161,19 @@ class HabboUsernameFinder(commands.Cog):
         )
 
     async def check_username(self, username: str) -> str:
-        """Return ``available``, ``taken``, or ``unknown`` for one Habbo name.
+        """Return ``unverified``, ``taken``, or ``unknown`` for one Habbo name.
 
-        Habbo returns 404 when no user owns a name. Other failures are kept as
-        unknown so temporary API trouble is never presented as availability.
+        The public profile API can prove that a name is taken, but a 404 only
+        proves that no public profile was found. Habbo may still reserve deleted,
+        moderated, or otherwise unavailable names, so a 404 must never be shown
+        as confirmed availability.
         """
         url = f"{HABBO_API_ROOT}?name={quote(username, safe='')}"
         try:
             await self.wait_for_api_request_slot()
             async with self.session.get(url) as response:
                 if response.status == 404:
-                    return "available"
+                    return "unverified"
                 if response.status == 200:
                     return "taken"
                 if response.status == 429:
@@ -188,15 +190,20 @@ class HabboUsernameFinder(commands.Cog):
     @staticmethod
     def build_results_embed(username: str, results: list[tuple[str, str]]) -> discord.Embed:
         """Format exact and close-match results in a compact Discord embed."""
-        symbols = {"available": "✅", "taken": "❌", "unknown": "⚠️"}
+        symbols = {"unverified": "🔎", "taken": "❌", "unknown": "⚠️"}
+        labels = {
+            "unverified": "No public profile found (claimability unverified)",
+            "taken": "Taken",
+            "unknown": "Could not check",
+        }
         exact_status = results[0][1]
         embed = discord.Embed(
             title=f"Habbo username: {username}",
-            description=f"{symbols[exact_status]} **{exact_status.title()}** at the time of this check.",
-            colour=discord.Colour.green() if exact_status == "available" else discord.Colour.blurple(),
+            description=f"{symbols[exact_status]} **{labels[exact_status]}**",
+            colour=discord.Colour.blurple(),
         )
         alternatives = [
-            f"{symbols[status]} `{candidate}` — {status.title()}"
+            f"{symbols[status]} `{candidate}` — {labels[status]}"
             for candidate, status in results[1:]
         ]
         embed.add_field(
@@ -204,7 +211,9 @@ class HabboUsernameFinder(commands.Cog):
             value="\n".join(alternatives) or "No valid close matches could be generated.",
             inline=False,
         )
-        embed.set_footer(text="Availability can change at any time; confirm on Habbo before choosing a name.")
+        embed.set_footer(
+            text="Only Habbo registration can confirm a name is claimable; its public API only confirms existing profiles."
+        )
         return embed
 
     @commands.hybrid_command(name="usernamefinder", description="Check a Habbo username and close matches.")
