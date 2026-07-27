@@ -15,22 +15,10 @@ from discord.ext import commands
 
 LOGGER = logging.getLogger(__name__)
 HABBO_API_ROOT = "https://www.habbo.com/api/public/users"
+DATAMUSE_API_ROOT = "https://api.datamuse.com/words"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,15}$")
 MAX_CLOSE_MATCHES = 10
-# These compact groups provide semantic alternatives without depending on a
-# third-party thesaurus service. Both directions are generated automatically.
-SYNONYM_GROUPS = (
-    ("cool", "chill"),
-    ("fast", "quick", "swift"),
-    ("happy", "cheerful", "glad"),
-    ("king", "royal"),
-    ("queen", "royal"),
-    ("smart", "clever", "bright"),
-    ("strong", "mighty", "powerful"),
-    ("dark", "shadow"),
-    ("light", "bright"),
-    ("fire", "flame"),
-)
+MAX_SYNONYMS_PER_WORD = 5
 
 
 class HabboUsernameFinder(commands.Cog):
@@ -59,28 +47,55 @@ class HabboUsernameFinder(commands.Cog):
         return normalized
 
     @staticmethod
-    def synonym_matches(username: str) -> list[str]:
-        """Return valid names made by replacing a recognized word with a synonym."""
-        lowered = username.lower()
+    def username_words(username: str) -> list[tuple[int, int, str]]:
+        """Locate ordinary and CamelCase words while retaining replacement spans."""
+        pattern = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])")
+        return [(match.start(), match.end(), match.group()) for match in pattern.finditer(username)]
+
+    async def fetch_synonyms(self, word: str) -> list[str]:
+        """Look up current synonyms instead of relying on a hard-coded word list."""
+        try:
+            async with self.session.get(
+                DATAMUSE_API_ROOT,
+                params={"rel_syn": word.lower(), "max": MAX_SYNONYMS_PER_WORD},
+            ) as response:
+                if response.status != 200:
+                    LOGGER.warning("Synonym lookup returned HTTP %s for %s", response.status, word)
+                    return []
+                payload = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            LOGGER.warning("Synonym lookup failed for %s: %s", word, exc)
+            return []
+
+        # Datamuse returns objects with a `word` property. Multi-word results
+        # cannot form a valid Habbo username segment, so they are discarded.
+        return [
+            item["word"]
+            for item in payload
+            if isinstance(item, dict)
+            and isinstance(item.get("word"), str)
+            and re.fullmatch(r"[A-Za-z]+", item["word"])
+        ][:MAX_SYNONYMS_PER_WORD]
+
+    async def synonym_matches(self, username: str) -> list[str]:
+        """Build valid alternatives from live thesaurus results for every word."""
+        words = self.username_words(username)
+        synonym_lists = await asyncio.gather(*(self.fetch_synonyms(word) for _, _, word in words))
         matches = []
-        for group in SYNONYM_GROUPS:
-            for word in group:
-                start = lowered.find(word)
-                if start < 0:
-                    continue
-                for synonym in group:
-                    if synonym == word:
-                        continue
-                    # Match the replaced word's leading capitalization so a
-                    # CamelCase username remains readable in the suggestions.
-                    replacement = synonym.capitalize() if username[start].isupper() else synonym
-                    candidate = username[:start] + replacement + username[start + len(word) :]
-                    if USERNAME_PATTERN.fullmatch(candidate):
-                        matches.append(candidate)
+        for (start, end, original), synonyms in zip(words, synonym_lists):
+            for synonym in synonyms:
+                replacement = synonym.capitalize() if original[0].isupper() else synonym.lower()
+                candidate = username[:start] + replacement + username[end:]
+                if USERNAME_PATTERN.fullmatch(candidate):
+                    matches.append(candidate)
         return matches
 
-    @classmethod
-    def close_matches(cls, username: str, limit: int = MAX_CLOSE_MATCHES) -> list[str]:
+    @staticmethod
+    def close_matches(
+        username: str,
+        synonyms: list[str] | None = None,
+        limit: int = MAX_CLOSE_MATCHES,
+    ) -> list[str]:
         """Create deterministic, valid alternatives that remain recognizably close.
 
         Semantic alternatives are preferred, followed by suffix, separator,
@@ -99,7 +114,7 @@ class HabboUsernameFinder(commands.Cog):
                 seen.add(candidate.casefold())
                 candidates.append(candidate)
 
-        for synonym in cls.synonym_matches(username):
+        for synonym in synonyms or []:
             add(synonym)
         for suffix in ("1", "2", "3", "_", "-", "."):
             # Make space for the edit when the requested name is already at the limit.
@@ -111,6 +126,11 @@ class HabboUsernameFinder(commands.Cog):
             if index >= 0:
                 add(username[:index] + new + username[index + 1 :])
         return candidates
+
+    async def find_suggestions(self, username: str) -> list[str]:
+        """Look up semantic alternatives, then fill remaining suggestion slots."""
+        synonyms = await self.synonym_matches(username)
+        return self.close_matches(username, synonyms)
 
     def _watcher(self):
         """Find the watcher that owns the process-wide Habbo request schedule."""
@@ -197,7 +217,7 @@ class HabboUsernameFinder(commands.Cog):
             return
 
         await ctx.defer(ephemeral=True)
-        names = [normalized, *self.close_matches(normalized)]
+        names = [normalized, *await self.find_suggestions(normalized)]
         # Keep lookups sequential: each one passes through the same one-request-
         # per-second gate used by watcher scans, preserving the shared API budget.
         statuses = [await self.check_username(name) for name in names]
