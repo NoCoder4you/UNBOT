@@ -292,6 +292,13 @@ class HabboWatch(commands.Cog):
                 await asyncio.sleep(delay)
             self._next_api_request_at = time.monotonic() + API_REQUEST_INTERVAL_SECONDS
 
+    def delay_api_requests(self, retry_after: float) -> None:
+        """Extend the shared Habbo cooldown after any cog receives HTTP 429."""
+        self._next_api_request_at = max(
+            self._next_api_request_at,
+            time.monotonic() + max(1.0, retry_after),
+        )
+
     async def fetch_json(self, url: str, params: dict | None = None) -> dict | list | None:
         try:
             await self.wait_for_api_request_slot()
@@ -305,10 +312,7 @@ class HabboWatch(commands.Cog):
                         retry_after = max(1.0, float(resp.headers.get("retry-after", "1")))
                     except (TypeError, ValueError):
                         retry_after = 1.0
-                    self._next_api_request_at = max(
-                        self._next_api_request_at,
-                        time.monotonic() + retry_after,
-                    )
+                    self.delay_api_requests(retry_after)
                     LOGGER.warning("Habbo API rate limited %s; pausing requests for %.1f seconds", url, retry_after)
                     return None
                 resp.raise_for_status()

@@ -1,0 +1,169 @@
+"""Tests for Habbo username validation, suggestions, and API interpretation."""
+
+import asyncio
+import importlib.util
+from pathlib import Path
+import sys
+import types
+import unittest
+
+
+def load_module():
+    aiohttp = types.ModuleType("aiohttp")
+    aiohttp.ClientSession = object
+    aiohttp.ClientTimeout = lambda **kwargs: kwargs
+    aiohttp.ClientError = type("ClientError", (Exception,), {})
+
+    class Embed:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.fields = []
+
+        def add_field(self, **kwargs):
+            self.fields.append(kwargs)
+
+        def set_footer(self, **kwargs):
+            self.footer = kwargs
+
+    discord = types.ModuleType("discord")
+    discord.Embed = Embed
+    discord.Colour = types.SimpleNamespace(green=lambda: "green", blurple=lambda: "blurple")
+    commands = types.ModuleType("discord.ext.commands")
+    commands.Cog = object
+    commands.Bot = object
+    commands.Context = object
+    commands.hybrid_command = lambda *args, **kwargs: lambda function: function
+    ext = types.ModuleType("discord.ext")
+    ext.commands = commands
+    sys.modules.update({"aiohttp": aiohttp, "discord": discord, "discord.ext": ext, "discord.ext.commands": commands})
+
+    path = Path(__file__).resolve().parents[1] / "COGS" / "HabboUsernameFinder.py"
+    spec = importlib.util.spec_from_file_location("habbo_username_finder_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Response:
+    def __init__(self, status, headers=None, payload=None):
+        self.status = status
+        self.headers = headers or {}
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def json(self):
+        return self.payload
+
+
+class Session:
+    def __init__(self, status):
+        self.status = status
+        self.urls = []
+
+    def get(self, url, **kwargs):
+        self.urls.append((url, kwargs))
+        return Response(self.status)
+
+
+class HabboUsernameFinderTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+        cls.finder = cls.module.HabboUsernameFinder
+
+    def test_normalize_username_accepts_valid_name(self):
+        self.assertEqual(self.finder.normalize_username("  Name-1  "), "Name-1")
+
+    def test_normalize_username_rejects_invalid_names(self):
+        for name in ("x", "has space", "name!", "a" * 16):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.finder.normalize_username(name)
+
+    def test_close_matches_are_unique_valid_and_bounded(self):
+        matches = self.finder.close_matches("Example")
+        self.assertLessEqual(len(matches), self.module.MAX_CLOSE_MATCHES)
+        self.assertEqual(len(matches), len({name.casefold() for name in matches}))
+        self.assertNotIn("example", {name.casefold() for name in matches})
+        self.assertTrue(all(self.module.USERNAME_PATTERN.fullmatch(name) for name in matches))
+        self.assertIn("Example1", matches)
+        self.assertIn("3xample", matches)
+
+    def test_check_username_does_not_claim_404_names_are_available(self):
+        for status, expected in ((200, "taken"), (404, "unverified"), (500, "unknown")):
+            with self.subTest(status=status):
+                finder = self.finder.__new__(self.finder)
+                finder.session = Session(status)
+                finder._api_request_lock = asyncio.Lock()
+                finder._next_api_request_at = 0.0
+                self.assertEqual(asyncio.run(finder.check_username("Name-1")), expected)
+                self.assertEqual(finder.session.urls, [(self.module.HABBO_API_ROOT + "?name=Name-1", {})])
+
+    def test_build_results_embed_labels_exact_and_close_results(self):
+        embed = self.finder.build_results_embed(
+            "Example", [("Example", "taken"), ("Example1", "unverified"), ("Example2", "unknown")]
+        )
+        self.assertIn("Taken", embed.kwargs["description"])
+        self.assertIn("`Example1` — No public profile found (claimability unverified)", embed.fields[0]["value"])
+        self.assertIn("`Example2` — Could not check", embed.fields[0]["value"])
+        self.assertIn("Only Habbo registration can confirm", embed.footer["text"])
+
+    def test_close_matches_prioritize_looked_up_synonyms(self):
+        matches = self.finder.close_matches("FastKing", ["QuickKing", "SwiftKing", "FastRoyal"])
+        self.assertEqual(matches[:3], ["QuickKing", "SwiftKing", "FastRoyal"])
+
+    def test_synonym_matches_looks_up_each_camelcase_word(self):
+        finder = self.finder.__new__(self.finder)
+        looked_up = []
+
+        async def fetch_synonyms(word):
+            looked_up.append(word)
+            return {"Fast": ["quick", "swift"], "King": ["royal"]}[word]
+
+        finder.fetch_synonyms = fetch_synonyms
+        matches = asyncio.run(finder.synonym_matches("FastKing"))
+
+        self.assertEqual(looked_up, ["Fast", "King"])
+        self.assertEqual(matches, ["QuickKing", "SwiftKing", "FastRoyal"])
+
+    def test_fetch_synonyms_uses_live_thesaurus_response(self):
+        class ThesaurusSession:
+            def __init__(self):
+                self.request = None
+
+            def get(self, url, **kwargs):
+                self.request = (url, kwargs)
+                return Response(200, payload=[{"word": "rapid"}, {"word": "high speed"}, {"bad": "value"}])
+
+        finder = self.finder.__new__(self.finder)
+        finder.session = ThesaurusSession()
+
+        self.assertEqual(asyncio.run(finder.fetch_synonyms("Fast")), ["rapid"])
+        self.assertEqual(
+            finder.session.request,
+            (self.module.DATAMUSE_API_ROOT, {"params": {"rel_syn": "fast", "max": 5}}),
+        )
+
+    def test_username_checks_use_watchers_shared_request_gate(self):
+        class Watcher:
+            def __init__(self):
+                self.waits = 0
+
+            async def wait_for_api_request_slot(self):
+                self.waits += 1
+
+        watcher = Watcher()
+        finder = self.finder.__new__(self.finder)
+        finder.bot = types.SimpleNamespace(get_cog=lambda name: watcher if name == "HabboWatch" else None)
+        finder.session = Session(404)
+
+        self.assertEqual(asyncio.run(finder.check_username("FastKing")), "unverified")
+        self.assertEqual(watcher.waits, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
