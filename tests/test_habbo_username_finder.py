@@ -45,8 +45,10 @@ def load_module():
 
 
 class Response:
-    def __init__(self, status):
+    def __init__(self, status, headers=None, payload=None):
         self.status = status
+        self.headers = headers or {}
+        self.payload = payload
 
     async def __aenter__(self):
         return self
@@ -54,14 +56,17 @@ class Response:
     async def __aexit__(self, *args):
         return None
 
+    async def json(self):
+        return self.payload
+
 
 class Session:
     def __init__(self, status):
         self.status = status
         self.urls = []
 
-    def get(self, url):
-        self.urls.append(url)
+    def get(self, url, **kwargs):
+        self.urls.append((url, kwargs))
         return Response(self.status)
 
 
@@ -93,8 +98,10 @@ class HabboUsernameFinderTest(unittest.TestCase):
             with self.subTest(status=status):
                 finder = self.finder.__new__(self.finder)
                 finder.session = Session(status)
+                finder._api_request_lock = asyncio.Lock()
+                finder._next_api_request_at = 0.0
                 self.assertEqual(asyncio.run(finder.check_username("Name-1")), expected)
-                self.assertEqual(finder.session.urls, [self.module.HABBO_API_ROOT + "?name=Name-1"])
+                self.assertEqual(finder.session.urls, [(self.module.HABBO_API_ROOT + "?name=Name-1", {})])
 
     def test_build_results_embed_labels_exact_and_close_results(self):
         embed = self.finder.build_results_embed(
@@ -103,6 +110,58 @@ class HabboUsernameFinderTest(unittest.TestCase):
         self.assertIn("Taken", embed.kwargs["description"])
         self.assertIn("`Example1` — Available", embed.fields[0]["value"])
         self.assertIn("`Example2` — Unknown", embed.fields[0]["value"])
+
+    def test_close_matches_prioritize_looked_up_synonyms(self):
+        matches = self.finder.close_matches("FastKing", ["QuickKing", "SwiftKing", "FastRoyal"])
+        self.assertEqual(matches[:3], ["QuickKing", "SwiftKing", "FastRoyal"])
+
+    def test_synonym_matches_looks_up_each_camelcase_word(self):
+        finder = self.finder.__new__(self.finder)
+        looked_up = []
+
+        async def fetch_synonyms(word):
+            looked_up.append(word)
+            return {"Fast": ["quick", "swift"], "King": ["royal"]}[word]
+
+        finder.fetch_synonyms = fetch_synonyms
+        matches = asyncio.run(finder.synonym_matches("FastKing"))
+
+        self.assertEqual(looked_up, ["Fast", "King"])
+        self.assertEqual(matches, ["QuickKing", "SwiftKing", "FastRoyal"])
+
+    def test_fetch_synonyms_uses_live_thesaurus_response(self):
+        class ThesaurusSession:
+            def __init__(self):
+                self.request = None
+
+            def get(self, url, **kwargs):
+                self.request = (url, kwargs)
+                return Response(200, payload=[{"word": "rapid"}, {"word": "high speed"}, {"bad": "value"}])
+
+        finder = self.finder.__new__(self.finder)
+        finder.session = ThesaurusSession()
+
+        self.assertEqual(asyncio.run(finder.fetch_synonyms("Fast")), ["rapid"])
+        self.assertEqual(
+            finder.session.request,
+            (self.module.DATAMUSE_API_ROOT, {"params": {"rel_syn": "fast", "max": 5}}),
+        )
+
+    def test_username_checks_use_watchers_shared_request_gate(self):
+        class Watcher:
+            def __init__(self):
+                self.waits = 0
+
+            async def wait_for_api_request_slot(self):
+                self.waits += 1
+
+        watcher = Watcher()
+        finder = self.finder.__new__(self.finder)
+        finder.bot = types.SimpleNamespace(get_cog=lambda name: watcher if name == "HabboWatch" else None)
+        finder.session = Session(404)
+
+        self.assertEqual(asyncio.run(finder.check_username("FastKing")), "available")
+        self.assertEqual(watcher.waits, 1)
 
 
 if __name__ == "__main__":
