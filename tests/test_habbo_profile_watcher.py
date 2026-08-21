@@ -210,6 +210,48 @@ class HabboPerUserTimeFileTest(unittest.TestCase):
         self.assertEqual(data["total_seconds"], {"online": 600, "offline": 300})
         self.assertEqual(data["last_observed_at"], (started + timedelta(minutes=15)).isoformat())
 
+    def test_restart_gap_is_split_at_known_offline_timestamp(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            last_observed = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+            went_offline = last_observed + timedelta(minutes=10)
+            restarted_at = last_observed + timedelta(days=1)
+            watch.update_user_time_file("Echo", "Echo", "MOD", True, last_observed)
+
+            # This is the first API result after the bot was unavailable. Habbo
+            # supplies the transition time inside that unobserved interval.
+            watch.update_user_time_file(
+                "Echo", "Echo", "MOD", False, restarted_at, went_offline,
+                {"lastAccessTime": went_offline.isoformat()},
+            )
+            data = __import__("json").loads((Path(directory) / "echo.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["status_since"], went_offline.isoformat())
+        self.assertEqual(
+            data["total_seconds"],
+            {"online": 600, "offline": 23 * 3600 + 50 * 60},
+        )
+
+    def test_transition_before_last_observation_assigns_gap_to_new_status(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            last_observed = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+            watch.update_user_time_file("Foxtrot", "Foxtrot", "OOA", True, last_observed)
+            watch.update_user_time_file(
+                "Foxtrot", "Foxtrot", "OOA", False,
+                last_observed + timedelta(hours=2),
+                last_observed - timedelta(minutes=5),
+            )
+            data = __import__("json").loads((Path(directory) / "foxtrot.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["total_seconds"], {"online": 0, "offline": 7200})
+
     def test_new_offline_user_uses_known_last_access_as_initial_duration(self):
         from datetime import datetime, timedelta, timezone
 

@@ -252,22 +252,39 @@ class HabboWatch(commands.Cog):
             LOGGER.warning("Invalid totals in per-user time file %s; resetting totals", path)
             online_total = offline_total = 0
 
+        if known_status_since:
+            if known_status_since.tzinfo is None:
+                known_status_since = known_status_since.replace(tzinfo=timezone.utc)
+            known_status_since = known_status_since.astimezone(timezone.utc)
         if last_observed and last_observed.tzinfo is None:
             last_observed = last_observed.replace(tzinfo=timezone.utc)
         if last_observed and observed_at > last_observed and previous_status:
-            elapsed = int((observed_at - last_observed).total_seconds())
+            # A precise API transition inside a restart gap divides the gap
+            # between the persisted and newly observed states. Without this,
+            # all downtime would incorrectly accrue to the old state.
+            transition_at = (
+                known_status_since
+                if previous_status != status
+                and known_status_since
+                and known_status_since <= observed_at
+                else None
+            )
+            old_state_until = max(last_observed, transition_at) if transition_at else observed_at
+            old_elapsed = int(max(0, (old_state_until - last_observed).total_seconds()))
+            new_elapsed = int(max(0, (observed_at - old_state_until).total_seconds()))
             if previous_status == "online":
-                online_total += elapsed
+                online_total += old_elapsed
             else:
-                offline_total += elapsed
+                offline_total += old_elapsed
+            if status == "online":
+                online_total += new_elapsed
+            else:
+                offline_total += new_elapsed
 
         status_since = self.parse_iso(data.get("status_since")) if previous_status == status else None
         if status_since and not is_online and known_status_since:
             if status_since.tzinfo is None:
                 status_since = status_since.replace(tzinfo=timezone.utc)
-            if known_status_since.tzinfo is None:
-                known_status_since = known_status_since.replace(tzinfo=timezone.utc)
-            known_status_since = known_status_since.astimezone(timezone.utc)
             # Habbo can later report newer activity that occurred inside what
             # looked like one long offline window. Correct that window instead
             # of retaining time that the user was demonstrably active.
@@ -277,9 +294,6 @@ class HabboWatch(commands.Cog):
         if status_since is None:
             status_since = observed_at
             if not is_online and known_status_since:
-                if known_status_since.tzinfo is None:
-                    known_status_since = known_status_since.replace(tzinfo=timezone.utc)
-                known_status_since = known_status_since.astimezone(timezone.utc)
                 if known_status_since <= observed_at:
                     status_since = known_status_since
                     # Seed only a brand-new file; later intervals are accounted
