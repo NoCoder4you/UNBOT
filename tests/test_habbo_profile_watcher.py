@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 def load_watcher_module():
@@ -182,6 +183,51 @@ class HabboManualJsonUpdateTest(unittest.TestCase):
         watch = self.make_watch()
         with self.assertRaises(ValueError):
             watch.apply_manual_json_update("Alpha", "away", None, "MOD")
+
+
+class HabboPerUserTimeFileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_watcher_module()
+        cls.watch_cls = cls.module.HabboWatch
+
+    def test_each_user_file_accumulates_time_in_previous_observed_status(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            started = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", True, started)
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", True, started + timedelta(minutes=5))
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", False, started + timedelta(minutes=10))
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", False, started + timedelta(minutes=15))
+
+            data = __import__("json").loads((Path(directory) / "alpha.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["status"], "offline")
+        self.assertEqual(data["status_since"], (started + timedelta(minutes=10)).isoformat())
+        self.assertEqual(data["total_seconds"], {"online": 600, "offline": 300})
+        self.assertEqual(data["last_observed_at"], (started + timedelta(minutes=15)).isoformat())
+
+    def test_new_offline_user_uses_known_last_access_as_initial_duration(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            observed = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+            last_access = observed - timedelta(hours=3)
+            watch.update_user_time_file("Bravo", "Bravo", "OOA", False, observed, last_access)
+            data = __import__("json").loads((Path(directory) / "bravo.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["status_since"], last_access.isoformat())
+        self.assertEqual(data["total_seconds"]["offline"], 10800)
+
+    def test_user_filename_rejects_path_traversal(self):
+        for username in ("../alpha", "..", "alpha/beta"):
+            with self.subTest(username=username), self.assertRaises(ValueError):
+                self.watch_cls.user_time_filename(username)
 
 
 class FakeInteractionResponse:
