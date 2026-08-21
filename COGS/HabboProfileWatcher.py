@@ -194,6 +194,18 @@ class HabboWatch(commands.Cog):
             raise ValueError("Habbo username cannot be used as a user JSON filename.")
         return f"{normalized}.json"
 
+    @staticmethod
+    def normalize_api_timestamp(value: object) -> str | None:
+        """Normalize a Habbo API timestamp to an explicit UTC ISO-8601 value."""
+        if not isinstance(value, str):
+            return None
+        parsed = HabboWatch.parse_iso(value)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
     def update_user_time_file(
         self,
         username: str,
@@ -202,6 +214,7 @@ class HabboWatch(commands.Cog):
         is_online: bool,
         observed_at: datetime,
         known_status_since: datetime | None = None,
+        user_json: dict | None = None,
     ) -> None:
         """Persist observation-based online/offline time for one watched user.
 
@@ -274,6 +287,18 @@ class HabboWatch(commands.Cog):
                     if not data:
                         offline_total = int((observed_at - known_status_since).total_seconds())
 
+        api_times = data.get("habbo_api_times") if isinstance(data.get("habbo_api_times"), dict) else {}
+        if isinstance(user_json, dict):
+            # Keep API-owned account timestamps separate from watcher-owned
+            # observation times, but use the same UTC representation for both.
+            for output_key, api_key in (
+                ("last_access_at", "lastAccessTime"),
+                ("member_since", "memberSince"),
+            ):
+                normalized = self.normalize_api_timestamp(user_json.get(api_key))
+                if normalized is not None:
+                    api_times[output_key] = normalized
+
         data = {
             "username": display_name,
             "username_normalized": username.strip().lower(),
@@ -282,6 +307,7 @@ class HabboWatch(commands.Cog):
             "status_since": status_since.isoformat(),
             "last_observed_at": observed_at.isoformat(),
             "total_seconds": {"online": online_total, "offline": offline_total},
+            "habbo_api_times": api_times,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".json.tmp")
@@ -1072,6 +1098,16 @@ class HabboWatch(commands.Cog):
                 continue
             display_name = user_json.get("name") or requested_username
             was_corrected = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
+            is_online = user_json.get("online", user_json.get("isOnline")) is True
+            self.update_user_time_file(
+                username_lc,
+                display_name,
+                policy_name,
+                is_online,
+                datetime.now(timezone.utc),
+                self.parse_habbo_last_access(user_json) if not is_online else None,
+                user_json,
+            )
             if was_corrected:
                 corrected += 1
         if corrected:
@@ -1143,6 +1179,7 @@ class HabboWatch(commands.Cog):
                 is_online,
                 observed_at,
                 st.get("offline_since"),
+                user_json,
             )
             st["was_online"] = is_online
             embed, *_ = self.evaluate_user(user_json, requested_username, st.get("offline_since"), policy_name)
@@ -1294,6 +1331,7 @@ class HabboWatch(commands.Cog):
                 datetime.now(timezone.utc),
                 self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
                 if not is_online else None,
+                user_json,
             )
 
             if state_changed:

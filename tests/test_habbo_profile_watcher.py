@@ -224,6 +224,52 @@ class HabboPerUserTimeFileTest(unittest.TestCase):
         self.assertEqual(data["status_since"], last_access.isoformat())
         self.assertEqual(data["total_seconds"]["offline"], 10800)
 
+    def test_habbo_api_times_are_normalized_to_utc_in_user_file(self):
+        from datetime import datetime, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            watch.update_user_time_file(
+                "Charlie",
+                "Charlie",
+                "MOD",
+                False,
+                datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+                user_json={
+                    "lastAccessTime": "2026-08-21T13:30:00+02:00",
+                    "memberSince": "2020-01-02T03:04:05.000Z",
+                },
+            )
+            data = __import__("json").loads((Path(directory) / "charlie.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            data["habbo_api_times"],
+            {
+                "last_access_at": "2026-08-21T11:30:00+00:00",
+                "member_since": "2020-01-02T03:04:05+00:00",
+            },
+        )
+
+    def test_invalid_api_time_does_not_overwrite_previous_normalized_value(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            observed = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+            watch.update_user_time_file(
+                "Delta", "Delta", "OOA", True, observed,
+                user_json={"lastAccessTime": "2026-08-21 11:00:00+0000"},
+            )
+            watch.update_user_time_file(
+                "Delta", "Delta", "OOA", True, observed + timedelta(minutes=5),
+                user_json={"lastAccessTime": "not-a-time"},
+            )
+            data = __import__("json").loads((Path(directory) / "delta.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["habbo_api_times"]["last_access_at"], "2026-08-21T11:00:00+00:00")
+
     def test_user_filename_rejects_path_traversal(self):
         for username in ("../alpha", "..", "alpha/beta"):
             with self.subTest(username=username), self.assertRaises(ValueError):
