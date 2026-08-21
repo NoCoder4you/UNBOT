@@ -313,9 +313,29 @@ class HabboPerUserTimeFileTest(unittest.TestCase):
         self.assertEqual(data["habbo_api_times"]["last_access_at"], "2026-08-21T11:00:00+00:00")
 
     def test_user_filename_rejects_path_traversal(self):
-        for username in ("../alpha", "..", "alpha/beta"):
+        for username in ("../alpha", "..", "alpha/beta", "alpha\\beta"):
             with self.subTest(username=username), self.assertRaises(ValueError):
                 self.watch_cls.user_time_filename(username)
+
+    def test_user_filename_encodes_supported_non_file_safe_characters(self):
+        self.assertEqual(self.watch_cls.user_time_filename(":Alpha!"), "%3Aalpha%21.json")
+        self.assertEqual(self.watch_cls.user_time_filename("Habbö"), "habb%C3%B6.json")
+
+    def test_non_file_safe_username_can_persist_time_without_stopping_watcher(self):
+        from datetime import datetime, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            watch.update_user_time_file(
+                ":Alpha!", ":Alpha!", "MOD", True,
+                datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+            )
+
+            saved_file = Path(directory) / "%3Aalpha%21.json"
+            data = __import__("json").loads(saved_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(data["username"], ":Alpha!")
 
 
 class FakeInteractionResponse:

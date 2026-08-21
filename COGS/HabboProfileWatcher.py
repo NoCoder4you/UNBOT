@@ -5,8 +5,8 @@ import os
 import json
 import logging
 import time
-import re
 from pathlib import Path
+from urllib.parse import quote
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -188,11 +188,25 @@ class HabboWatch(commands.Cog):
 
     @staticmethod
     def user_time_filename(username: str) -> str:
-        """Return a safe, predictable filename for a Habbo username."""
+        """Return a safe, predictable filename for a Habbo username.
+
+        Some established Habbo names contain punctuation outside the subset
+        that is safe in filenames on every supported operating system. Encode
+        those characters rather than allowing one such roster member to stop
+        the entire background watcher loop.
+        """
         normalized = username.strip().lower()
-        if not normalized or not re.fullmatch(r"[a-z0-9._-]+", normalized) or normalized in {".", ".."}:
+        if (
+            not normalized
+            or normalized in {".", ".."}
+            or "/" in normalized
+            or "\\" in normalized
+            or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+        ):
             raise ValueError("Habbo username cannot be used as a user JSON filename.")
-        return f"{normalized}.json"
+
+        encoded = quote(normalized, safe="abcdefghijklmnopqrstuvwxyz0123456789._-")
+        return f"{encoded}.json"
 
     @staticmethod
     def normalize_api_timestamp(value: object) -> str | None:
