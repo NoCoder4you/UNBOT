@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 def load_watcher_module():
@@ -182,6 +183,139 @@ class HabboManualJsonUpdateTest(unittest.TestCase):
         watch = self.make_watch()
         with self.assertRaises(ValueError):
             watch.apply_manual_json_update("Alpha", "away", None, "MOD")
+
+
+class HabboPerUserTimeFileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_watcher_module()
+        cls.watch_cls = cls.module.HabboWatch
+
+    def test_each_user_file_accumulates_time_in_previous_observed_status(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            started = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", True, started)
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", True, started + timedelta(minutes=5))
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", False, started + timedelta(minutes=10))
+            watch.update_user_time_file("Alpha", "Alpha", "MOD", False, started + timedelta(minutes=15))
+
+            data = __import__("json").loads((Path(directory) / "alpha.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["status"], "offline")
+        self.assertEqual(data["status_since"], (started + timedelta(minutes=10)).isoformat())
+        self.assertEqual(data["total_seconds"], {"online": 600, "offline": 300})
+        self.assertEqual(data["last_observed_at"], (started + timedelta(minutes=15)).isoformat())
+
+    def test_restart_gap_is_split_at_known_offline_timestamp(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            last_observed = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+            went_offline = last_observed + timedelta(minutes=10)
+            restarted_at = last_observed + timedelta(days=1)
+            watch.update_user_time_file("Echo", "Echo", "MOD", True, last_observed)
+
+            # This is the first API result after the bot was unavailable. Habbo
+            # supplies the transition time inside that unobserved interval.
+            watch.update_user_time_file(
+                "Echo", "Echo", "MOD", False, restarted_at, went_offline,
+                {"lastAccessTime": went_offline.isoformat()},
+            )
+            data = __import__("json").loads((Path(directory) / "echo.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["status_since"], went_offline.isoformat())
+        self.assertEqual(
+            data["total_seconds"],
+            {"online": 600, "offline": 23 * 3600 + 50 * 60},
+        )
+
+    def test_transition_before_last_observation_assigns_gap_to_new_status(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            last_observed = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+            watch.update_user_time_file("Foxtrot", "Foxtrot", "OOA", True, last_observed)
+            watch.update_user_time_file(
+                "Foxtrot", "Foxtrot", "OOA", False,
+                last_observed + timedelta(hours=2),
+                last_observed - timedelta(minutes=5),
+            )
+            data = __import__("json").loads((Path(directory) / "foxtrot.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["total_seconds"], {"online": 0, "offline": 7200})
+
+    def test_new_offline_user_uses_known_last_access_as_initial_duration(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            observed = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+            last_access = observed - timedelta(hours=3)
+            watch.update_user_time_file("Bravo", "Bravo", "OOA", False, observed, last_access)
+            data = __import__("json").loads((Path(directory) / "bravo.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["status_since"], last_access.isoformat())
+        self.assertEqual(data["total_seconds"]["offline"], 10800)
+
+    def test_habbo_api_times_are_normalized_to_utc_in_user_file(self):
+        from datetime import datetime, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            watch.update_user_time_file(
+                "Charlie",
+                "Charlie",
+                "MOD",
+                False,
+                datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+                user_json={
+                    "lastAccessTime": "2026-08-21T13:30:00+02:00",
+                    "memberSince": "2020-01-02T03:04:05.000Z",
+                },
+            )
+            data = __import__("json").loads((Path(directory) / "charlie.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            data["habbo_api_times"],
+            {
+                "last_access_at": "2026-08-21T11:30:00+00:00",
+                "member_since": "2020-01-02T03:04:05+00:00",
+            },
+        )
+
+    def test_invalid_api_time_does_not_overwrite_previous_normalized_value(self):
+        from datetime import datetime, timedelta, timezone
+
+        watch = self.watch_cls.__new__(self.watch_cls)
+        with TemporaryDirectory() as directory:
+            watch.users_dir = Path(directory)
+            observed = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+            watch.update_user_time_file(
+                "Delta", "Delta", "OOA", True, observed,
+                user_json={"lastAccessTime": "2026-08-21 11:00:00+0000"},
+            )
+            watch.update_user_time_file(
+                "Delta", "Delta", "OOA", True, observed + timedelta(minutes=5),
+                user_json={"lastAccessTime": "not-a-time"},
+            )
+            data = __import__("json").loads((Path(directory) / "delta.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(data["habbo_api_times"]["last_access_at"], "2026-08-21T11:00:00+00:00")
+
+    def test_user_filename_rejects_path_traversal(self):
+        for username in ("../alpha", "..", "alpha/beta"):
+            with self.subTest(username=username), self.assertRaises(ValueError):
+                self.watch_cls.user_time_filename(username)
 
 
 class FakeInteractionResponse:

@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import time
+import re
 from pathlib import Path
 import discord
 from discord import app_commands
@@ -66,6 +67,8 @@ class HabboWatch(commands.Cog):
         self.logoff_file = bot_root / "JSON" / "habbo_logoff_times.json"
         self.offline_records_file = bot_root / "JSON" / "habbo_offline_records.json"
         self.alert_channels_file = bot_root / "JSON" / "habbo_alert_channels.json"
+        self.users_dir = bot_root / "JSON" / "USERS"
+        self.users_dir.mkdir(parents=True, exist_ok=True)
         self.last_online_times = self.load_last_online_times()
         self.logoff_times = self.load_logoff_times()
         self.offline_records = self.load_offline_records()
@@ -182,6 +185,151 @@ class HabboWatch(commands.Cog):
             self.offline_records_file.write_text(payload, encoding="utf-8")
         except Exception:
             pass
+
+    @staticmethod
+    def user_time_filename(username: str) -> str:
+        """Return a safe, predictable filename for a Habbo username."""
+        normalized = username.strip().lower()
+        if not normalized or not re.fullmatch(r"[a-z0-9._-]+", normalized) or normalized in {".", ".."}:
+            raise ValueError("Habbo username cannot be used as a user JSON filename.")
+        return f"{normalized}.json"
+
+    @staticmethod
+    def normalize_api_timestamp(value: object) -> str | None:
+        """Normalize a Habbo API timestamp to an explicit UTC ISO-8601 value."""
+        if not isinstance(value, str):
+            return None
+        parsed = HabboWatch.parse_iso(value)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    def update_user_time_file(
+        self,
+        username: str,
+        display_name: str,
+        policy_name: str,
+        is_online: bool,
+        observed_at: datetime,
+        known_status_since: datetime | None = None,
+        user_json: dict | None = None,
+    ) -> None:
+        """Persist observation-based online/offline time for one watched user.
+
+        Elapsed time between successful polls is assigned to the previously
+        observed state. A transition starts a new session at the observation
+        time, while a reliable Habbo last-access timestamp can seed the first
+        offline session after a fresh installation.
+        """
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        observed_at = observed_at.astimezone(timezone.utc)
+        users_dir = getattr(self, "users_dir", None)
+        if users_dir is None:
+            # Supports lightweight test/maintenance instances created without
+            # running the cog constructor; normal bot instances always set it.
+            return
+        path = users_dir / self.user_time_filename(username)
+        data: dict = {}
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Could not read per-user time file %s; rebuilding it", path)
+
+        status = "online" if is_online else "offline"
+        previous_status = data.get("status") if data.get("status") in {"online", "offline"} else None
+        last_observed = self.parse_iso(data.get("last_observed_at"))
+        totals = data.get("total_seconds") if isinstance(data.get("total_seconds"), dict) else {}
+        try:
+            online_total = max(0, int(totals.get("online", 0) or 0))
+            offline_total = max(0, int(totals.get("offline", 0) or 0))
+        except (TypeError, ValueError):
+            LOGGER.warning("Invalid totals in per-user time file %s; resetting totals", path)
+            online_total = offline_total = 0
+
+        if known_status_since:
+            if known_status_since.tzinfo is None:
+                known_status_since = known_status_since.replace(tzinfo=timezone.utc)
+            known_status_since = known_status_since.astimezone(timezone.utc)
+        if last_observed and last_observed.tzinfo is None:
+            last_observed = last_observed.replace(tzinfo=timezone.utc)
+        if last_observed and observed_at > last_observed and previous_status:
+            # A precise API transition inside a restart gap divides the gap
+            # between the persisted and newly observed states. Without this,
+            # all downtime would incorrectly accrue to the old state.
+            transition_at = (
+                known_status_since
+                if previous_status != status
+                and known_status_since
+                and known_status_since <= observed_at
+                else None
+            )
+            old_state_until = max(last_observed, transition_at) if transition_at else observed_at
+            old_elapsed = int(max(0, (old_state_until - last_observed).total_seconds()))
+            new_elapsed = int(max(0, (observed_at - old_state_until).total_seconds()))
+            if previous_status == "online":
+                online_total += old_elapsed
+            else:
+                offline_total += old_elapsed
+            if status == "online":
+                online_total += new_elapsed
+            else:
+                offline_total += new_elapsed
+
+        status_since = self.parse_iso(data.get("status_since")) if previous_status == status else None
+        if status_since and not is_online and known_status_since:
+            if status_since.tzinfo is None:
+                status_since = status_since.replace(tzinfo=timezone.utc)
+            # Habbo can later report newer activity that occurred inside what
+            # looked like one long offline window. Correct that window instead
+            # of retaining time that the user was demonstrably active.
+            if status_since < known_status_since <= observed_at:
+                offline_total = max(0, offline_total - int((known_status_since - status_since).total_seconds()))
+                status_since = known_status_since
+        if status_since is None:
+            status_since = observed_at
+            if not is_online and known_status_since:
+                if known_status_since <= observed_at:
+                    status_since = known_status_since
+                    # Seed only a brand-new file; later intervals are accounted
+                    # for from successful observations to avoid double counting.
+                    if not data:
+                        offline_total = int((observed_at - known_status_since).total_seconds())
+
+        api_times = data.get("habbo_api_times") if isinstance(data.get("habbo_api_times"), dict) else {}
+        if isinstance(user_json, dict):
+            # Keep API-owned account timestamps separate from watcher-owned
+            # observation times, but use the same UTC representation for both.
+            for output_key, api_key in (
+                ("last_access_at", "lastAccessTime"),
+                ("member_since", "memberSince"),
+            ):
+                normalized = self.normalize_api_timestamp(user_json.get(api_key))
+                if normalized is not None:
+                    api_times[output_key] = normalized
+
+        data = {
+            "username": display_name,
+            "username_normalized": username.strip().lower(),
+            "policy": policy_name,
+            "status": status,
+            "status_since": status_since.isoformat(),
+            "last_observed_at": observed_at.isoformat(),
+            "total_seconds": {"online": online_total, "offline": offline_total},
+            "habbo_api_times": api_times,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+            temporary.replace(path)
+        except OSError:
+            LOGGER.exception("Could not save per-user time file %s", path)
 
     def load_alert_channel_ids(self) -> dict[str, list[int]]:
         defaults = {
@@ -565,6 +713,14 @@ class HabboWatch(commands.Cog):
             self.record_offline_start(username_lc, display_name, policy, observed_at)
             message = f"Saved {display_name} as offline since {observed_at.isoformat()} in the Habbo JSON files."
 
+        self.update_user_time_file(
+            username_lc,
+            display_name,
+            policy,
+            status_lc == "online",
+            observed_at,
+            observed_at if status_lc == "offline" else None,
+        )
         self.save_last_online_times()
         self.save_logoff_times()
         self.save_offline_records()
@@ -956,6 +1112,16 @@ class HabboWatch(commands.Cog):
                 continue
             display_name = user_json.get("name") or requested_username
             was_corrected = self.reconcile_last_access_for_user(username_lc, display_name, policy_name, user_json)
+            is_online = user_json.get("online", user_json.get("isOnline")) is True
+            self.update_user_time_file(
+                username_lc,
+                display_name,
+                policy_name,
+                is_online,
+                datetime.now(timezone.utc),
+                self.parse_habbo_last_access(user_json) if not is_online else None,
+                user_json,
+            )
             if was_corrected:
                 corrected += 1
         if corrected:
@@ -1019,6 +1185,16 @@ class HabboWatch(commands.Cog):
                 st["offline_since"] = self.parse_iso(self.logoff_times.get(username_lc)) or self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
                 if st["offline_since"]:
                     self.record_offline_start(username_lc, display_name, policy_name, st["offline_since"])
+            observed_at = datetime.now(timezone.utc)
+            self.update_user_time_file(
+                username_lc,
+                display_name,
+                policy_name,
+                is_online,
+                observed_at,
+                st.get("offline_since"),
+                user_json,
+            )
             st["was_online"] = is_online
             embed, *_ = self.evaluate_user(user_json, requested_username, st.get("offline_since"), policy_name)
             await self.notify_user(embed, policy_name)
@@ -1160,6 +1336,17 @@ class HabboWatch(commands.Cog):
 
             st["was_online"] = is_online
             self._state[username_lc] = st
+
+            self.update_user_time_file(
+                username_lc,
+                display_name,
+                policy_name,
+                is_online,
+                datetime.now(timezone.utc),
+                self.parse_iso(self.offline_records.get(username_lc, {}).get("current_offline_since"))
+                if not is_online else None,
+                user_json,
+            )
 
             if state_changed:
                 self.save_last_online_times()
