@@ -418,7 +418,7 @@ class HabboAlertRoutingTest(unittest.TestCase):
 
         self.assertEqual(watch.alert_channel_ids_for_policy("MOD"), [])
 
-    def test_notify_user_sends_to_configured_policy_channel(self):
+    def test_notify_user_mentions_owner_for_offline_alert(self):
         import asyncio
 
         channel = FakeAlertDestination()
@@ -426,7 +426,7 @@ class HabboAlertRoutingTest(unittest.TestCase):
         watch = self.make_watch(bot)
         watch.alert_channel_ids["MOD"] = [333]
 
-        asyncio.run(watch.notify_user("embed-payload", "MOD"))
+        asyncio.run(watch.notify_user("embed-payload", "MOD", mention_owner=True))
 
         self.assertEqual(channel.sent_embeds, ["embed-payload"])
         self.assertEqual(
@@ -439,6 +439,17 @@ class HabboAlertRoutingTest(unittest.TestCase):
         )
         self.assertEqual(bot.dm_user.sent_embeds, [])
         self.assertEqual(bot.requested_channel_ids, [("get", 333)])
+
+    def test_notify_user_does_not_mention_owner_for_other_alerts(self):
+        import asyncio
+
+        channel = FakeAlertDestination()
+        watch = self.make_watch(FakeAlertBot(cached_channel=channel))
+        watch.alert_channel_ids["MOD"] = [333]
+
+        asyncio.run(watch.notify_user("embed-payload", "MOD"))
+
+        self.assertEqual(channel.sent_messages, [{"embed": "embed-payload"}])
 
     def test_notify_user_falls_back_to_dm_when_policy_channel_unset(self):
         import asyncio
@@ -512,6 +523,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         watch.logoff_times = {}
         watch.offline_records = {}
         watch.notifications = []
+        watch.owner_mentions = []
         watch.errors = []
         watch.saved = []
         # Production retries back off to protect the API. Unit tests use zero
@@ -524,8 +536,9 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         async def fetch_habbo_user(username):
             return users_by_name.get(username.lower())
 
-        async def notify_user(embed, policy_name=None):
+        async def notify_user(embed, policy_name=None, mention_owner=False):
             watch.notifications.append((embed.title, policy_name))
+            watch.owner_mentions.append(mention_owner)
 
         async def message_error_to_owner(message, **kwargs):
             watch.errors.append((message, kwargs))
@@ -770,6 +783,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.run_periodic_once(watch)
 
         self.assertEqual(watch.notifications, [("Offline Warning (2 Days 23 Hours)", "MOD")])
+        self.assertEqual(watch.owner_mentions, [True])
         self.assertIn("offline_mod_2d_23h", watch._state["alpha"]["sent_alerts"])
         self.assertEqual(watch.offline_records["alpha"]["sent_alerts"], ["offline_mod_2d_23h"])
 
@@ -809,6 +823,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.run_periodic_once(watch)
 
         self.assertEqual(watch.notifications, [("OOA Offline Warning (23 Hours)", "OOA")])
+        self.assertEqual(watch.owner_mentions, [True])
 
     def test_evaluate_user_uses_discord_relative_times_for_offline_status(self):
         from datetime import datetime, timedelta, timezone
