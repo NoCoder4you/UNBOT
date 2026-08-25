@@ -32,6 +32,7 @@ def load_watcher_module():
 
     discord_stub.Embed = EmbedStub
     discord_stub.TextChannel = object
+    discord_stub.AllowedMentions = lambda **kwargs: kwargs
     discord_stub.Colour = types.SimpleNamespace(
         blurple=lambda: "blurple",
         red=lambda: "red",
@@ -363,9 +364,11 @@ class FakeInteraction:
 class FakeAlertDestination:
     def __init__(self):
         self.sent_embeds = []
+        self.sent_messages = []
 
-    async def send(self, embed=None):
+    async def send(self, embed=None, **kwargs):
         self.sent_embeds.append(embed)
+        self.sent_messages.append({"embed": embed, **kwargs})
 
 
 class FakeAlertBot:
@@ -426,6 +429,14 @@ class HabboAlertRoutingTest(unittest.TestCase):
         asyncio.run(watch.notify_user("embed-payload", "MOD"))
 
         self.assertEqual(channel.sent_embeds, ["embed-payload"])
+        self.assertEqual(
+            channel.sent_messages,
+            [{
+                "embed": "embed-payload",
+                "content": f"<@{self.module.NOTIFY_USER_ID}>",
+                "allowed_mentions": {"users": True, "roles": False, "everyone": False},
+            }],
+        )
         self.assertEqual(bot.dm_user.sent_embeds, [])
         self.assertEqual(bot.requested_channel_ids, [("get", 333)])
 
