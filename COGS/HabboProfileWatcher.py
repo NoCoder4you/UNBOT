@@ -11,7 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-NOTIFY_USER_ID = 298121351871594497  # DM recipient
+NOTIFY_USER_ID = 298121351871594497  # Channel mention and DM fallback recipient
 
 # Optional Discord channel destinations for policy-specific watcher alerts.
 # Leave either value unset/blank to keep that policy falling back to the DM recipient above.
@@ -996,8 +996,13 @@ class HabboWatch(commands.Cog):
         self.save_alert_channel_ids()
         return channel_ids
 
-    async def notify_user(self, embed: discord.Embed, policy_name: str | None = None):
-        """Send an alert to every configured policy channel, otherwise DM Noah."""
+    async def notify_user(
+        self,
+        embed: discord.Embed,
+        policy_name: str | None = None,
+        mention_owner: bool = False,
+    ):
+        """Send a channel alert, mentioning Noah only for offline alerts, or DM him."""
         channel_ids = self.alert_channel_ids_for_policy(policy_name)
         sent_to_channel = False
         for channel_id in channel_ids:
@@ -1005,7 +1010,17 @@ class HabboWatch(commands.Cog):
                 channel = self.bot.get_channel(channel_id) if hasattr(self.bot, "get_channel") else None
                 if channel is None:
                     channel = await self.bot.fetch_channel(channel_id)
-                await channel.send(embed=embed)
+                send_options = {"embed": embed}
+                if mention_owner:
+                    send_options.update(
+                        content=f"<@{NOTIFY_USER_ID}>",
+                        allowed_mentions=discord.AllowedMentions(
+                            users=True,
+                            roles=False,
+                            everyone=False,
+                        ),
+                    )
+                await channel.send(**send_options)
                 sent_to_channel = True
             except Exception as exc:
                 LOGGER.warning("Unable to send Habbo %s alert to channel %s: %s", policy_name, channel_id, exc)
@@ -1338,7 +1353,11 @@ class HabboWatch(commands.Cog):
             if was_corrected:
                 alert_key = None
             if alert_key and alert_key not in st["sent_alerts"]:
-                await self.notify_user(embed, policy_name)
+                await self.notify_user(
+                    embed,
+                    policy_name,
+                    mention_owner=alert_key.startswith("offline_"),
+                )
                 st["sent_alerts"].add(alert_key)
                 self.mark_persisted_alert_sent(username_lc, display_name, policy_name, alert_key)
                 state_changed = True
