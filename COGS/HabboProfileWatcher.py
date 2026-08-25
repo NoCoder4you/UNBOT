@@ -11,7 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-NOTIFY_USER_ID = 298121351871594497  # DM recipient
+NOTIFY_USER_ID = 298121351871594497  # Channel mention and DM fallback recipient
 
 # Optional Discord channel destinations for policy-specific watcher alerts.
 # Leave either value unset/blank to keep that policy falling back to the DM recipient above.
@@ -997,7 +997,7 @@ class HabboWatch(commands.Cog):
         return channel_ids
 
     async def notify_user(self, embed: discord.Embed, policy_name: str | None = None):
-        """Send an alert to every configured policy channel, otherwise DM Noah."""
+        """Mention Noah in every configured policy channel, otherwise DM him."""
         channel_ids = self.alert_channel_ids_for_policy(policy_name)
         sent_to_channel = False
         for channel_id in channel_ids:
@@ -1005,7 +1005,15 @@ class HabboWatch(commands.Cog):
                 channel = self.bot.get_channel(channel_id) if hasattr(self.bot, "get_channel") else None
                 if channel is None:
                     channel = await self.bot.fetch_channel(channel_id)
-                await channel.send(embed=embed)
+                await channel.send(
+                    content=f"<@{NOTIFY_USER_ID}>",
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True,
+                        roles=False,
+                        everyone=False,
+                    ),
+                )
                 sent_to_channel = True
             except Exception as exc:
                 LOGGER.warning("Unable to send Habbo %s alert to channel %s: %s", policy_name, channel_id, exc)
