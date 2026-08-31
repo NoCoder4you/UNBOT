@@ -783,7 +783,7 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.run_periodic_once(watch)
 
         self.assertEqual(watch.notifications, [("Offline Warning (2 Days 23 Hours)", "MOD")])
-        self.assertEqual(watch.owner_mentions, [True])
+        self.assertEqual(watch.owner_mentions, [False])
         self.assertIn("offline_mod_2d_23h", watch._state["alpha"]["sent_alerts"])
         self.assertEqual(watch.offline_records["alpha"]["sent_alerts"], ["offline_mod_2d_23h"])
 
@@ -823,6 +823,38 @@ class HabboPeriodicNotificationTest(unittest.TestCase):
         self.run_periodic_once(watch)
 
         self.assertEqual(watch.notifications, [("OOA Offline Warning (23 Hours)", "OOA")])
+        self.assertEqual(watch.owner_mentions, [False])
+
+    def test_periodic_check_mentions_owner_at_mod_three_day_limit(self):
+        from datetime import datetime, timedelta, timezone
+
+        users = {"alpha": {"name": "Alpha", "online": False, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: ["Alpha"], self.module.OOA_GROUP_ID: []}, users)
+        watch._state["alpha"] = {
+            "was_online": False,
+            "offline_since": datetime.now(timezone.utc) - timedelta(days=3),
+            "sent_alerts": set(),
+        }
+
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [("Offline Warning (3 Days)", "MOD")])
+        self.assertEqual(watch.owner_mentions, [True])
+
+    def test_periodic_check_mentions_owner_at_ooa_one_day_limit(self):
+        from datetime import datetime, timedelta, timezone
+
+        users = {"alpha": {"name": "Alpha", "online": False, "profileVisible": True}}
+        watch = self.make_watch({self.module.MOD_GROUP_ID: [], self.module.OOA_GROUP_ID: ["Alpha"]}, users)
+        watch._state["alpha"] = {
+            "was_online": False,
+            "offline_since": datetime.now(timezone.utc) - timedelta(days=1),
+            "sent_alerts": set(),
+        }
+
+        self.run_periodic_once(watch)
+
+        self.assertEqual(watch.notifications, [("OOA Offline Warning (24 Hours)", "OOA")])
         self.assertEqual(watch.owner_mentions, [True])
 
     def test_evaluate_user_uses_discord_relative_times_for_offline_status(self):

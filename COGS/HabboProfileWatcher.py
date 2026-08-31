@@ -52,6 +52,10 @@ POLICIES = {
     "OOA": {"allowed_days": 1.0, "milestones": OOA_MILESTONES},
 }
 
+# Mention the configured recipient only when a member reaches the policy's
+# final limit. Earlier checkpoints still post their embeds without a ping.
+MENTION_ALERT_KEYS = frozenset({"offline_mod_3d", "offline_ooa_24h"})
+
 class HabboWatch(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -1002,7 +1006,7 @@ class HabboWatch(commands.Cog):
         policy_name: str | None = None,
         mention_owner: bool = False,
     ):
-        """Send a channel alert, mentioning Noah only for offline alerts, or DM him."""
+        """Send a channel alert, optionally mentioning the configured recipient, or DM them."""
         channel_ids = self.alert_channel_ids_for_policy(policy_name)
         sent_to_channel = False
         for channel_id in channel_ids:
@@ -1356,7 +1360,7 @@ class HabboWatch(commands.Cog):
                 await self.notify_user(
                     embed,
                     policy_name,
-                    mention_owner=alert_key.startswith("offline_"),
+                    mention_owner=alert_key in MENTION_ALERT_KEYS,
                 )
                 st["sent_alerts"].add(alert_key)
                 self.mark_persisted_alert_sent(username_lc, display_name, policy_name, alert_key)
